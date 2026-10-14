@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.14"
+APP_VERSION = "0.3.15"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -1388,11 +1388,11 @@ class GraphReviewDialog(tk.Toplevel):
         self.pan_left_button = ttk.Button(
             toolbar, text="◀", width=3, style="Icon.TButton", command=lambda: self._pan(SNAPSHOT_PAN_STEP_SECONDS)
         )
-        self.pan_left_button.pack(side="right", padx=(6, 0))
         self.pan_right_button = ttk.Button(
             toolbar, text="▶", width=3, style="Icon.TButton", command=lambda: self._pan(-SNAPSHOT_PAN_STEP_SECONDS)
         )
         self.pan_right_button.pack(side="right")
+        self.pan_left_button.pack(side="right", padx=(6, 0))
         self.pause_button = ttk.Button(toolbar, command=self._toggle_pause)
         self.pause_button.pack(side="right", padx=(0, 6))
         self.save_button = ttk.Button(toolbar, text="Save Snapshot…", command=self.app.save_graph_snapshot)
