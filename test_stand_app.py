@@ -31,15 +31,24 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.2.0"
 DEFAULT_SENSOR_LOG_SECONDS = 1.0
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
+AUTO_ARCHIVE_INTERVAL_SECONDS = 60 * 60
+AUTO_ARCHIVE_CONFIG_FILENAME = "auto_archive.json"
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
 MIN_CYCLE_STOP_SEPARATION_DEGREES = 1.0
 CALIBRATION_STREAM_SAMPLE_COUNT = 100
 LABJACK_LJM_WINDOWS_URL = "https://support.labjack.com/docs/ljm-software-installer-windows"
 GITHUB_RELEASES_URL = "https://github.com/leonardx548/Senior-Design/releases/latest"
+
+EXPORT_FILE_OPTIONS = (
+    ("sensor", "Sensor readings", "sensor_readings.csv"),
+    ("events", "Event log", "events.csv"),
+    ("metadata", "Run metadata", "live_run.json"),
+    ("configuration", "Run configuration", "run_configuration.json"),
+)
 
 
 def format_local_timestamp(value: object, fallback: str = "Not available") -> str:
@@ -49,6 +58,83 @@ def format_local_timestamp(value: object, fallback: str = "Not available") -> st
         return timestamp.astimezone().strftime("%Y-%m-%d %I:%M %p")
     except (TypeError, ValueError):
         return fallback
+
+
+def filtered_live_run_csv(folder: Path, filename: str, run_id: str) -> str:
+    """Return one logical run's CSV rows with their original header."""
+    source = folder / filename
+    if not source.is_file():
+        return ""
+    output = StringIO(newline="")
+    with source.open("r", newline="", encoding="utf-8") as source_file:
+        reader = csv.DictReader(source_file)
+        if not reader.fieldnames or "live_run_id" not in reader.fieldnames:
+            return ""
+        writer = csv.DictWriter(output, fieldnames=reader.fieldnames, lineterminator="\n")
+        writer.writeheader()
+        for row in reader:
+            if row.get("live_run_id") == run_id:
+                writer.writerow(row)
+    return output.getvalue()
+
+
+def write_live_run_archive(
+    destination: Path,
+    selected_runs: list[tuple[Path, dict[str, object]]],
+    selected_keys: set[str],
+    *,
+    manifest_extra: dict[str, object] | None = None,
+) -> int:
+    """Write and verify a self-contained ZIP before replacing its destination."""
+    options = [option for option in EXPORT_FILE_OPTIONS if option[0] in selected_keys]
+    if not selected_runs:
+        raise ValueError("At least one live run is required for an archive.")
+    if not options:
+        raise ValueError("Choose at least one data type for the archive.")
+    if not destination.parent.is_dir():
+        raise OSError(f"Archive folder is unavailable: {destination.parent}")
+
+    manifest = {
+        "schema_version": 3,
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_application": "Senior Design Test Stand",
+        "selected_live_runs": [
+            {"application_session": folder.name, "live_run_id": run.get("id")} for folder, run in selected_runs
+        ],
+        "included_file_types": [filename for _key, _label, filename in options],
+    }
+    if manifest_extra:
+        manifest.update(manifest_extra)
+
+    temporary = destination.with_name(f".{destination.name}.{time.time_ns()}.tmp")
+    count = 0
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("export_manifest.json", json.dumps(manifest, indent=2))
+            count += 1
+            for folder, run in selected_runs:
+                run_id = str(run["id"])
+                archive_folder = f"{folder.name}/{run_id}"
+                for key, _label, filename in options:
+                    if key in {"sensor", "events"}:
+                        contents = filtered_live_run_csv(folder, filename, run_id)
+                    elif key == "metadata":
+                        contents = json.dumps(run, indent=2)
+                    else:
+                        contents = json.dumps(run.get("configuration", {}), indent=2)
+                    archive.writestr(f"{archive_folder}/{filename}", contents)
+                    count += 1
+        with zipfile.ZipFile(temporary, "r") as archive:
+            if archive.testzip() is not None:
+                raise OSError("The archive failed ZIP integrity verification.")
+        temporary.replace(destination)
+        return count
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class LivePlot(tk.Canvas):
@@ -567,7 +653,7 @@ class AdvancedLoggingDialog(tk.Toplevel):
         ttk.Label(outer, text="Standard sensor-log rate", font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Choose how often dashboard readings are written to the CSV. This does not affect cycle counting.",
+            text="Choose how often live-run dashboard readings are written to the CSV. This does not affect cycle counting.",
             wraplength=510,
             foreground="#475569",
         ).pack(anchor="w", pady=(5, 13))
@@ -608,14 +694,9 @@ class AdvancedLoggingDialog(tk.Toplevel):
 
 
 class ExportDataDialog(tk.Toplevel):
-    """Export logical Start-to-Stop test runs while retaining the full local session log."""
+    """Export logical Start-to-Stop test runs retained in local staging."""
 
-    FILE_OPTIONS = (
-        ("sensor", "Sensor readings (filtered to each live run)", "sensor_readings.csv"),
-        ("events", "Event log / command outcomes (filtered to each live run)", "events.csv"),
-        ("metadata", "Live-run metadata", "live_run.json"),
-        ("configuration", "Configuration captured when each live run started", "run_configuration.json"),
-    )
+    FILE_OPTIONS = EXPORT_FILE_OPTIONS
 
     def __init__(self, app: "TestStandApp", preselect_run_id: str | None = None) -> None:
         super().__init__(app)
@@ -638,7 +719,7 @@ class ExportDataDialog(tk.Toplevel):
         ttk.Label(outer, text="Export live test runs", font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Live runs begin with Start Counting and end with Stop or Reset. Complete local history is retained.",
+            text="Live runs begin with Start Counting and end with Stop or Reset. Retained local runs can be packaged here.",
             wraplength=710,
             foreground="#475569",
         ).pack(anchor="w", pady=(4, 10))
@@ -703,23 +784,6 @@ class ExportDataDialog(tk.Toplevel):
         else:
             self.status_var.set("No live runs yet. Start and then stop counting to create an exportable run.")
 
-    @staticmethod
-    def _filtered_csv(folder: Path, filename: str, run_id: str) -> str:
-        source = folder / filename
-        if not source.is_file():
-            return ""
-        output = StringIO(newline="")
-        with source.open("r", newline="", encoding="utf-8") as source_file:
-            reader = csv.DictReader(source_file)
-            if not reader.fieldnames or "live_run_id" not in reader.fieldnames:
-                return ""
-            writer = csv.DictWriter(output, fieldnames=reader.fieldnames, lineterminator="\n")
-            writer.writeheader()
-            for row in reader:
-                if row.get("live_run_id") == run_id:
-                    writer.writerow(row)
-        return output.getvalue()
-
     def export(self) -> None:
         selected_indexes = self.runs_list.curselection()
         selected_options = [option for option in self.FILE_OPTIONS if self.option_vars[option[0]].get()]
@@ -741,35 +805,17 @@ class ExportDataDialog(tk.Toplevel):
 
         self.app.logger.flush()
         selected_runs = [self.live_runs[index] for index in selected_indexes]
-        archive_manifest = {
-            "schema_version": 2,
-            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "source_application": "Senior Design Test Stand",
-            "selected_live_runs": [
-                {"application_session": folder.name, "live_run_id": run.get("id")} for folder, run in selected_runs
-            ],
-            "included_file_types": [filename for _key, _label, filename in selected_options],
-        }
-        count = 0
         exported_run_ids_by_folder: dict[Path, set[str]] = {}
         try:
-            with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("export_manifest.json", json.dumps(archive_manifest, indent=2))
-                count += 1
-                for folder, run in selected_runs:
-                    run_id = str(run["id"])
-                    archive_folder = f"{folder.name}/{run_id}"
-                    for key, _label, filename in selected_options:
-                        if key in {"sensor", "events"}:
-                            contents = self._filtered_csv(folder, filename, run_id)
-                        elif key == "metadata":
-                            contents = json.dumps(run, indent=2)
-                        else:
-                            contents = json.dumps(run.get("configuration", {}), indent=2)
-                        archive.writestr(f"{archive_folder}/{filename}", contents)
-                        count += 1
-                    exported_run_ids_by_folder.setdefault(folder, set()).add(run_id)
-        except (OSError, ValueError, csv.Error) as error:
+            count = write_live_run_archive(
+                Path(destination),
+                selected_runs,
+                {key for key, _label, _filename in selected_options},
+                manifest_extra={"archive_type": "manual"},
+            )
+            for folder, run in selected_runs:
+                exported_run_ids_by_folder.setdefault(folder, set()).add(str(run["id"]))
+        except (OSError, ValueError, csv.Error, zipfile.BadZipFile) as error:
             messagebox.showerror("Export failed", f"Could not create the ZIP archive:\n{error}", parent=self)
             return
         for folder, run_ids in exported_run_ids_by_folder.items():
@@ -781,6 +827,104 @@ class ExportDataDialog(tk.Toplevel):
             parent=self,
         )
         self.refresh_runs()
+
+
+class AutoArchiveDialog(tk.Toplevel):
+    """Configure hands-off, hourly ZIP archives for active test time."""
+
+    def __init__(self, app: "TestStandApp") -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("Configure Automatic Archives")
+        self.geometry("760x470")
+        self.minsize(680, 430)
+        self.resizable(False, False)
+        self.transient(app)
+        config = app.auto_archive_config
+        self.enabled_var = tk.BooleanVar(value=bool(config["enabled"]))
+        self.directory_var = tk.StringVar(value=str(config["directory"]))
+        selected = set(config["include"])
+        self.option_vars = {key: tk.BooleanVar(value=key in selected) for key, _label, _filename in EXPORT_FILE_OPTIONS}
+        self.status_var = tk.StringVar(
+            value="Settings changed during a test apply when the next test starts."
+            if app.is_running else "Archives are created after each active hour."
+        )
+        self._build()
+        self.lift()
+        self.focus_force()
+
+    def _build(self) -> None:
+        outer = ttk.Frame(self, padding=18)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Automatic test archives", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text=(
+                "While cycle counting is active, the app creates a verified ZIP after each hour of active test time. "
+                "Stopping counting creates a final ZIP for the remaining portion. Local segment data is removed only "
+                "after that archive succeeds."
+            ),
+            wraplength=700,
+            foreground="#475569",
+        ).pack(anchor="w", pady=(5, 14))
+
+        ttk.Checkbutton(
+            outer,
+            text="Automatically archive active test data",
+            variable=self.enabled_var,
+        ).pack(anchor="w", pady=(0, 12))
+
+        directory = ttk.LabelFrame(outer, text="Archive folder", padding=10)
+        directory.pack(fill="x")
+        directory.columnconfigure(0, weight=1)
+        ttk.Entry(directory, textvariable=self.directory_var, state="readonly").grid(row=0, column=0, sticky="ew")
+        ttk.Button(directory, text="Choose Folder…", command=self.choose_directory).grid(row=0, column=1, padx=(8, 0))
+
+        options = ttk.LabelFrame(outer, text="Include in each ZIP", padding=10)
+        options.pack(fill="x", pady=(12, 8))
+        for index, (key, label, _filename) in enumerate(EXPORT_FILE_OPTIONS):
+            ttk.Checkbutton(options, text=label, variable=self.option_vars[key]).grid(
+                row=index // 2, column=index % 2, sticky="w", padx=(0, 28), pady=2
+            )
+        ttk.Label(
+            options,
+            text="A manifest and the run's captured configuration are included when selected.",
+            foreground="#475569",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Label(outer, textvariable=self.status_var, foreground="#1e3a8a", wraplength=700).pack(
+            anchor="w", pady=(6, 8)
+        )
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Save Settings", style="Grease.TButton", command=self.save).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+
+    def choose_directory(self) -> None:
+        selected = filedialog.askdirectory(parent=self, title="Choose Automatic Archive Folder")
+        if selected:
+            self.directory_var.set(selected)
+
+    def save(self) -> None:
+        selected_keys = [key for key, _label, _filename in EXPORT_FILE_OPTIONS if self.option_vars[key].get()]
+        directory = self.directory_var.get().strip()
+        if self.enabled_var.get() and not directory:
+            messagebox.showerror("Archive folder required", "Choose a folder for automatic ZIP archives.", parent=self)
+            return
+        if self.enabled_var.get() and not Path(directory).is_dir():
+            messagebox.showerror("Archive folder unavailable", "Choose an existing folder that can receive ZIP files.", parent=self)
+            return
+        if self.enabled_var.get() and not selected_keys:
+            messagebox.showerror("Select data", "Choose at least one data type to include in each archive.", parent=self)
+            return
+        self.app.configure_auto_archive(
+            enabled=self.enabled_var.get(),
+            directory=directory,
+            include=selected_keys,
+        )
+        if self.app.is_running:
+            self.app.log_event("Automatic archive settings changed", "The updated settings apply to the next test run.")
+        self.destroy()
 
 
 class LocalDataDialog(tk.Toplevel):
@@ -957,8 +1101,14 @@ class TestStandApp(tk.Tk):
         self.logger = CsvLogger(self.paths.logs)
         self.is_running = False
         self.current_live_run_id: str | None = None
+        self.last_tick = time.monotonic()
         self.last_sensor_log = 0.0
         self.sensor_log_interval_seconds = DEFAULT_SENSOR_LOG_SECONDS
+        self.auto_archive_config = self.load_auto_archive_config()
+        self.active_auto_archive_config: dict[str, object] | None = None
+        self.auto_archive_active = False
+        self.auto_archive_elapsed_seconds = 0.0
+        self.auto_archive_segment_number = 0
         self.cycles = 0
         self.cycle_state = "waiting_for_retracted"
         self.cycle_times: deque[float] = deque()
@@ -1026,6 +1176,7 @@ class TestStandApp(tk.Tk):
         menu_bar = tk.Menu(self)
         file_menu = tk.Menu(menu_bar, tearoff=False)
         file_menu.add_command(label="Export Runs…", command=self.open_export_window)
+        file_menu.add_command(label="Configure Auto-Archive…", command=self.open_auto_archive_window)
         file_menu.add_command(label="Open Local Data Folder", command=self.open_local_data_folder)
         file_menu.add_command(label="Manage Local Data…", command=self.open_local_data_window)
         menu_bar.add_cascade(label="File", menu=file_menu)
@@ -1245,6 +1396,11 @@ class TestStandApp(tk.Tk):
             "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "app_version": APP_VERSION,
             "sensor_log_interval_seconds": self.sensor_log_interval_seconds,
+            "automatic_archive": {
+                "enabled": self.auto_archive_config["enabled"],
+                "interval_seconds": AUTO_ARCHIVE_INTERVAL_SECONDS,
+                "included_data": self.auto_archive_config["include"],
+            },
             "position_calibration": self.position_calibration,
             "cycle_stops": self.cycle_stops,
             "signals": {
@@ -1254,6 +1410,153 @@ class TestStandApp(tk.Tk):
                 "physical_outputs": "not implemented",
             },
         }
+
+    @staticmethod
+    def _default_auto_archive_config() -> dict[str, object]:
+        return {"enabled": False, "directory": "", "include": [key for key, _label, _file in EXPORT_FILE_OPTIONS]}
+
+    def load_auto_archive_config(self) -> dict[str, object]:
+        """Read a conservative, validated auto-archive configuration."""
+        config = self._default_auto_archive_config()
+        saved = self.paths.read_config(AUTO_ARCHIVE_CONFIG_FILENAME)
+        if not saved:
+            return config
+        configured_keys = saved.get("include", config["include"])
+        if not isinstance(configured_keys, list):
+            configured_keys = config["include"]
+        allowed_keys = {key for key, _label, _file in EXPORT_FILE_OPTIONS}
+        include = [str(key) for key in configured_keys if str(key) in allowed_keys]
+        return {
+            "enabled": bool(saved.get("enabled", False)),
+            "directory": str(saved.get("directory", "")).strip(),
+            "include": include or list(config["include"]),
+        }
+
+    def configure_auto_archive(self, *, enabled: bool, directory: str, include: list[str]) -> None:
+        self.auto_archive_config = {
+            "enabled": bool(enabled),
+            "directory": directory,
+            "include": include,
+        }
+        self.paths.write_config(AUTO_ARCHIVE_CONFIG_FILENAME, self.auto_archive_config)
+        self._write_run_configuration_snapshot()
+
+    @staticmethod
+    def _auto_archive_config_is_ready(config: dict[str, object]) -> bool:
+        if not config["enabled"] or not config["include"]:
+            return False
+        try:
+            return Path(str(config["directory"])).is_dir()
+        except (TypeError, OSError):
+            return False
+
+    def _replace_logger(self) -> None:
+        """Start a clean local staging session after a verified archive."""
+        self.logger = CsvLogger(self.paths.logs)
+        self.logger.update_manifest(
+            app_version=APP_VERSION,
+            sensor_log_interval_seconds=self.sensor_log_interval_seconds,
+        )
+        self._write_run_configuration_snapshot()
+        self.last_sensor_log = time.monotonic()
+
+    def _start_auto_archive_run(self) -> None:
+        self.auto_archive_elapsed_seconds = 0.0
+        self.auto_archive_segment_number = 0
+        candidate = {
+            "enabled": self.auto_archive_config["enabled"],
+            "directory": self.auto_archive_config["directory"],
+            "include": list(self.auto_archive_config["include"]),
+        }
+        self.auto_archive_active = self._auto_archive_config_is_ready(candidate)
+        self.active_auto_archive_config = candidate if self.auto_archive_active else None
+        if self.auto_archive_active:
+            self.auto_archive_segment_number = 1
+            self.log_event(
+                "Automatic archive enabled",
+                "Segment 1 will be archived after one hour of active test time.",
+            )
+        elif self.auto_archive_config["enabled"]:
+            self.log_event(
+                "Automatic archive unavailable",
+                "The configured archive folder is unavailable. Data remains local for manual export.",
+            )
+
+    def _auto_archive_destination(self, reason: str) -> Path:
+        if self.active_auto_archive_config is None:
+            raise ValueError("Automatic archive settings are not active for this run.")
+        directory = Path(str(self.active_auto_archive_config["directory"]))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = f"TestStand_{timestamp}_segment_{self.auto_archive_segment_number:03d}_{reason}"
+        destination = directory / f"{stem}.zip"
+        suffix = 2
+        while destination.exists():
+            destination = directory / f"{stem}_{suffix:02d}.zip"
+            suffix += 1
+        return destination
+
+    def _archive_auto_segment(self, status: str, reason: str, *, continue_running: bool) -> bool:
+        """Archive one completed segment; never discard it until its ZIP verifies."""
+        if not self.auto_archive_active or not self.current_live_run_id:
+            return True
+        run_id = self.current_live_run_id
+        segment_seconds = self.auto_archive_elapsed_seconds
+        self.log_event(
+            "Automatic archive started",
+            f"Preparing segment {self.auto_archive_segment_number} after {segment_seconds / 60:.1f} active minutes.",
+        )
+        self._finish_live_run(status)
+        runs = CsvLogger.read_live_runs(self.logger.folder)
+        run = next((item for item in runs if item.get("id") == run_id), None)
+        if run is None:
+            self.log_event("Automatic archive failed", "The completed run metadata could not be located. Local data was retained.")
+            return False
+        destination = self._auto_archive_destination(reason)
+        try:
+            count = write_live_run_archive(
+                destination,
+                [(self.logger.folder, run)],
+                set(self.active_auto_archive_config["include"] if self.active_auto_archive_config else []),
+                manifest_extra={
+                    "archive_type": "automatic",
+                    "archive_reason": reason,
+                    "segment_number": self.auto_archive_segment_number,
+                    "active_test_seconds": round(segment_seconds, 1),
+                },
+            )
+        except (OSError, ValueError, csv.Error, zipfile.BadZipFile) as error:
+            self.log_event("Automatic archive failed", f"Local data was retained: {error}")
+            if continue_running:
+                self._begin_live_run()
+                self.auto_archive_elapsed_seconds = 0.0
+            return False
+
+        cleanup_error: OSError | ValueError | None = None
+        self.logger.close()
+        try:
+            self.paths.delete_run_directory(self.logger.folder)
+        except (OSError, ValueError) as error:
+            cleanup_error = error
+        self._replace_logger()
+        self.auto_archive_elapsed_seconds = 0.0
+
+        if continue_running:
+            self.auto_archive_segment_number += 1
+            self._begin_live_run()
+            self.log_event(
+                "Automatic archive complete",
+                f"Created {destination.name} ({count} files). Segment {self.auto_archive_segment_number} is active.",
+            )
+        else:
+            self.auto_archive_active = False
+            self.active_auto_archive_config = None
+            self.log_event("Automatic archive complete", f"Created {destination.name} ({count} files).")
+        if cleanup_error:
+            self.log_event(
+                "Archive cleanup incomplete",
+                f"The ZIP was created, but the local segment could not be removed: {cleanup_error}",
+            )
+        return True
 
     def _write_run_configuration_snapshot(self) -> None:
         """Preserve current settings for the full application session."""
@@ -1311,7 +1614,10 @@ class TestStandApp(tk.Tk):
             self.is_running = False
             self.cycle_state = "waiting_for_retracted"
             self.log_event("Cycle counting stopped", "LabJack disconnected.")
-            self._finish_live_run("interrupted_by_disconnect")
+            if self.auto_archive_active:
+                self._archive_auto_segment("interrupted_by_disconnect", "interrupted", continue_running=False)
+            else:
+                self._finish_live_run("interrupted_by_disconnect")
 
     def start_counting(self) -> None:
         if not self.labjack_available:
@@ -1326,6 +1632,7 @@ class TestStandApp(tk.Tk):
         self.is_running = True
         self.cycle_state = "waiting_for_retracted"
         self._begin_live_run()
+        self._start_auto_archive_run()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         if self.cycle_stops:
@@ -1340,11 +1647,14 @@ class TestStandApp(tk.Tk):
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.log_event("Cycle counting stopped", "Cycle and CPM totals retained.")
-        self._finish_live_run("stopped")
+        if self.auto_archive_active:
+            self._archive_auto_segment("stopped", "final", continue_running=False)
+        else:
+            self._finish_live_run("stopped")
 
     def reset_counting(self) -> None:
         unexported_run = self._latest_unexported_live_run()
-        if unexported_run:
+        if unexported_run and not self.auto_archive_active:
             choice = messagebox.askyesnocancel(
                 "Save before reset?",
                 "This live run has not been exported. Save it before resetting?",
@@ -1359,7 +1669,10 @@ class TestStandApp(tk.Tk):
         was_running = self.is_running
         if was_running:
             self.log_event("Live run ended", "Reset started a new live run.")
-            self._finish_live_run("ended_by_reset")
+            if self.auto_archive_active:
+                self._archive_auto_segment("ended_by_reset", "reset", continue_running=False)
+            else:
+                self._finish_live_run("ended_by_reset")
         self.cycles = 0
         self.cycle_times.clear()
         self.cycle_state = "waiting_for_retracted"
@@ -1367,6 +1680,7 @@ class TestStandApp(tk.Tk):
         self.metric_vars["frequency"].set("0.0 cpm")
         if was_running:
             self._begin_live_run()
+            self._start_auto_archive_run()
             self.log_event("Live run started", "Cycle and CPM totals were reset.")
         self.log_event(
             "Cycle counting reset",
@@ -1572,6 +1886,9 @@ class TestStandApp(tk.Tk):
     def open_export_window(self, preselect_run_id: str | None = None) -> None:
         ExportDataDialog(self, preselect_run_id=preselect_run_id)
 
+    def open_auto_archive_window(self) -> None:
+        AutoArchiveDialog(self)
+
     def open_local_data_folder(self) -> None:
         try:
             os.startfile(self.paths.root)  # type: ignore[attr-defined]
@@ -1659,19 +1976,29 @@ class TestStandApp(tk.Tk):
 
     def tick(self) -> None:
         now = time.monotonic()
+        elapsed = max(0.0, now - self.last_tick)
+        self.last_tick = now
         self._update_live_bushing_position(now)
+        if self.is_running and self.auto_archive_active:
+            self.auto_archive_elapsed_seconds += elapsed
+            if self.auto_archive_elapsed_seconds >= AUTO_ARCHIVE_INTERVAL_SECONDS:
+                self._archive_auto_segment("hourly_archive", "hourly", continue_running=True)
         values = self._values()
         self.metric_vars["cycles"].set(str(self.cycles))
         self.metric_vars["frequency"].set(f"{values['frequency']:0.1f} cpm")
-        if now - self.last_sensor_log >= self.sensor_log_interval_seconds:
+        if self.current_live_run_id and now - self.last_sensor_log >= self.sensor_log_interval_seconds:
             self.logger.log_reading(values, live_run_id=self.current_live_run_id)
             self.last_sensor_log = now
         self.after(UPDATE_MS, self.tick)
 
     def on_close(self) -> None:
         if self.is_running:
+            self.is_running = False
             self.log_event("Live run interrupted", "Application closed while cycle counting was active.")
-            self._finish_live_run("interrupted_by_application_close")
+            if self.auto_archive_active:
+                self._archive_auto_segment("interrupted_by_application_close", "interrupted", continue_running=False)
+            else:
+                self._finish_live_run("interrupted_by_application_close")
         self.log_event("Application closed", "Operator closed the application.")
         self.ain2_monitor.close()
         self.logger.finalize(
@@ -1680,6 +2007,11 @@ class TestStandApp(tk.Tk):
             final_auxiliary_status="not_configured",
         )
         self.logger.close()
+        if not CsvLogger.read_live_runs(self.logger.folder):
+            try:
+                self.paths.delete_run_directory(self.logger.folder)
+            except (OSError, ValueError):
+                pass
         self.destroy()
 
 

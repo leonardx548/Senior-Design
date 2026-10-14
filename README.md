@@ -41,20 +41,24 @@ The GitHub project folder contains source code and documentation only. Each Wind
 
 Calibration and cycle stops are specific to the physical test stand, so they are intentionally not committed to GitHub. The first run after this update copies any older root-folder calibration files into this local location without deleting the originals. For a portable or shared data location, set the `SENIOR_DESIGN_DATA_DIR` environment variable before launching the app.
 
-## Exporting and managing run data
+## Automatic archives, exporting, and local data
 
-The application always keeps a complete local history for each launch, including time before/after cycle counting. Within that history, a **live run** begins when you press **Start Counting** and ends when you press **Stop**, Reset while counting, a LabJack disconnect, or application close. Use **File → Export Runs…** to select one or more of those live runs and create a portable ZIP. Toggle exactly what to include:
+A **live run** begins when you press **Start Counting** and ends when you press **Stop**, Reset while counting, a LabJack disconnect, or application close. Use **File → Configure Auto-Archive…** to choose an existing destination folder and the data types included in each archive. Once configured, the application writes a timestamped, verified ZIP after every hour of active test time; paused time does not count. Stop, Reset, disconnect, and application close each write a final ZIP for the remaining partial segment.
+
+Each automatic ZIP is first written to a temporary file and integrity-checked. Only after that succeeds is the corresponding local staging session removed. If the destination becomes unavailable or ZIP creation fails, nothing is discarded: the application records the failure and keeps the local data available for recovery.
+
+**File → Export Runs…** remains available as a manual recovery/export tool. It lets an operator select one or more retained live runs and create a portable ZIP. Both automatic and manual archives can include:
 
 - `sensor_readings.csv` — timestamped dashboard measurements;
 - `events.csv` — cycle detections, connection changes, and application events;
 - live-run metadata — start/end status, cycle totals, and whether it has been exported; and
 - `run_configuration.json` — the calibration, cycle stops, grease interval, and logging setup captured when that live run started.
 
-The ZIP always contains a small `export_manifest.json` and keeps every selected live run inside its own folder. This makes multi-run exports safe to unzip without one run's `events.csv` overwriting another's. The original local data stays in place after export, so it remains available for a later export or inspection; the app does not delete anything automatically. If Reset would clear the dashboard totals for a live run that has not yet been exported, the app offers to open the export window first. Choosing to reset anyway still retains the local data.
+The ZIP always contains a small `export_manifest.json` and keeps every selected live run inside its own folder. This makes multi-run exports safe to unzip without one run's `events.csv` overwriting another's. Automatic archives clear only their successfully archived local segment; manual exports retain local files. If automatic archiving is not configured, Reset offers the existing manual-export prompt before clearing the dashboard totals.
 
-Use **Edit → Advanced Logging…** (also available from the export window) to choose the standard `sensor_readings.csv` snapshot interval. It starts at **1 second** and accepts any positive interval. This controls file size only: live AIN2 is still acquired at 200 samples/second for display and cycle detection, and those raw samples are not continuously logged.
+Use **Edit → Advanced Logging…** (also available from the export window) to choose the standard `sensor_readings.csv` snapshot interval. It starts at **1 second** and accepts any positive interval. Snapshots are recorded while a live run is active. This controls file size only: live AIN2 is still acquired at 200 samples/second for display and cycle detection, and those raw samples are not continuously logged.
 
-Use **File → Open Local Data Folder** to inspect the stored configuration and logs in Windows Explorer. **File → Manage Local Data…** lists prior completed application sessions and can permanently remove selected sessions from the local computer. It never lists the application session that is currently open, warns when a selected session contains unexported data, and does not alter exported ZIP files. Calibration and cycle stops remain managed through their own setup dialogs.
+Use **File → Open Local Data Folder** to inspect the stored configuration and any retained logs in Windows Explorer. **File → Manage Local Data…** lists prior completed application sessions and can permanently remove selected sessions from the local computer. It never lists the application session that is currently open, warns when a selected session contains unexported data, and does not alter exported ZIP files. Calibration and cycle stops remain managed through their own setup dialogs.
 
 ## LabJack T4 connection diagnostic
 

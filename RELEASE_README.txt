@@ -26,6 +26,13 @@ Python is already included in this package. Do not install Python or run pip.
 The newest application ZIP is always on the project's Releases page:
 https://github.com/leonardx548/Senior-Design/releases/latest
 
+Automatic archives
+------------------
+Use File > Configure Auto-Archive... to choose an existing destination folder
+and the data included in each ZIP. The application writes a verified ZIP after
+each hour of active cycle-counting time and writes the remaining partial ZIP
+when counting stops. It retains local data if an archive cannot be created.
+
 Auxiliary channels
 ------------------
 The dashboard includes one grease-pressure card and four temperature cards so
