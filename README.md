@@ -59,6 +59,16 @@ The ZIP always contains a small `export_manifest.json` and keeps every selected 
 
 The application does not create a periodic dashboard-snapshot log or retain raw AIN2 samples. It uses the 200 Hz AIN2 stream while each stroke is underway, then writes only its completed-cycle metrics. This keeps long tests compact while preserving the measurements used for comparison.
 
+## Position and velocity graph snapshots
+
+The **Pause** button above the position and velocity charts freezes only those two chart displays, so an operator can inspect an event without interrupting the LabJack stream, cycle counting, velocity calculation, or normal run logging. It simultaneously freezes a rolling window of up to two minutes of calibrated AIN2 data at the hardware stream rate (normally 200 Hz). **Resume** returns the charts to the live view and discards that frozen copy.
+
+While paused, **Save Snapshot…** writes a timestamped folder. If an automatic archive/output folder is configured, it is created under `snapshots` in that folder; otherwise it is created under `%LOCALAPPDATA%\SeniorDesignTestStand\snapshots`. Each folder contains:
+
+- `position_velocity_200hz.csv` — timestamp, elapsed time, stream rate, raw AIN2 voltage, calibrated bushing angle, derived velocity, and stream-gap markers;
+- `position_graph.svg` and `velocity_graph.svg` — static copies of the paused chart displays; and
+- `snapshot_metadata.json` — capture duration, calibration, cycle stops, live-run ID, and file list.
+
 Use **File → Open Local Data Folder** to inspect the stored configuration and any retained logs in Windows Explorer. **File → Manage Local Data…** lists prior completed application sessions and can permanently remove selected sessions from the local computer. It never lists the application session that is currently open, warns when a selected session contains unexported data, and does not alter exported ZIP files. Calibration and cycle stops remain managed through their own setup dialogs.
 
 ## LabJack T4 connection diagnostic

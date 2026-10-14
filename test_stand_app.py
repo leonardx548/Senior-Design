@@ -21,6 +21,7 @@ import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from html import escape as xml_escape
 from io import StringIO
 from pathlib import Path
 from queue import Empty, Queue
@@ -32,11 +33,14 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
 GREASE_PRESSURE_RESPONSE_WINDOW_SECONDS = 10.0
+SNAPSHOT_HISTORY_SECONDS = 120
+SNAPSHOT_STREAM_RATE_HZ = 200
+SNAPSHOT_HISTORY_MAX_SAMPLES = SNAPSHOT_HISTORY_SECONDS * SNAPSHOT_STREAM_RATE_HZ
 AUTO_ARCHIVE_INTERVAL_SECONDS = 60 * 60
 AUTO_ARCHIVE_CONFIG_FILENAME = "auto_archive.json"
 VELOCITY_SLOPE_WINDOW_SAMPLES = 11
@@ -220,6 +224,19 @@ class GreaseEventCapture:
         }
 
 
+@dataclass(frozen=True)
+class PositionVelocitySnapshotSample:
+    """One calibrated raw-stream sample retained only for an on-demand snapshot."""
+
+    timestamp: str
+    monotonic_seconds: float
+    scan_rate_hz: float
+    ain2_voltage: float
+    position_degrees: float
+    velocity_degrees_per_second: float | None
+    stream_gap_before: bool = False
+
+
 def format_local_timestamp(value: object, fallback: str = "Not available") -> str:
     """Render saved ISO timestamps compactly for operator-facing lists."""
     try:
@@ -342,6 +359,64 @@ class LivePlot(tk.Canvas):
         """Draw labeled horizontal thresholds without affecting live samples."""
         self.reference_lines = lines
         self.redraw()
+
+    def snapshot_state(self) -> dict[str, object]:
+        """Capture the displayed graph state without depending on a screen capture tool."""
+        return {
+            "title": self.title,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "color": self.color,
+            "samples": tuple(self.samples),
+            "reference_lines": tuple(self.reference_lines),
+            "width": max(self.winfo_width(), 600),
+            "height": max(self.winfo_height(), 240),
+        }
+
+    @staticmethod
+    def write_svg(path: Path, state: dict[str, object]) -> None:
+        """Write a portable static chart that matches a saved dashboard graph."""
+        width, height = int(state["width"]), int(state["height"])
+        minimum, maximum = float(state["minimum"]), float(state["maximum"])
+        title, color = str(state["title"]), str(state["color"])
+        samples = tuple(float(value) for value in state["samples"])
+        reference_lines = tuple(state["reference_lines"])
+        margin_left, margin_right, margin_top, margin_bottom = 42, 14, 28, 28
+        chart_width = width - margin_left - margin_right
+        chart_height = height - margin_top - margin_bottom
+        lines = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
+            f'<text x="12" y="16" fill="#0f172a" font-family="Segoe UI, Arial" font-size="12" font-weight="700">{xml_escape(title)}</text>',
+        ]
+        for fraction in (0, 0.5, 1):
+            y = margin_top + chart_height * (1 - fraction)
+            value = minimum + (maximum - minimum) * fraction
+            lines.extend((
+                f'<line x1="{margin_left}" y1="{y:.2f}" x2="{width - margin_right}" y2="{y:.2f}" stroke="#e2e8f0"/>',
+                f'<text x="{margin_left - 5}" y="{y + 3:.2f}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">{value:,.1f}</text>',
+            ))
+        lines.extend((
+            f'<text x="{margin_left}" y="{height - 8}" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">older</text>',
+            f'<text x="{width - margin_right}" y="{height - 8}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">now</text>',
+        ))
+        for reference in reference_lines:
+            value, reference_color, label = float(reference[0]), str(reference[1]), str(reference[2])
+            if minimum <= value <= maximum:
+                y = margin_top + chart_height * (1 - (value - minimum) / (maximum - minimum))
+                lines.extend((
+                    f'<line x1="{margin_left}" y1="{y:.2f}" x2="{width - margin_right}" y2="{y:.2f}" stroke="{reference_color}" stroke-width="2" stroke-dasharray="5 3"/>',
+                    f'<text x="{width - margin_right - 3}" y="{y - 3:.2f}" text-anchor="end" fill="{reference_color}" font-family="Segoe UI, Arial" font-size="9" font-weight="700">{xml_escape(label)}</text>',
+                ))
+        if len(samples) >= 2:
+            points = []
+            for index, value in enumerate(samples):
+                x = margin_left + chart_width * index / (len(samples) - 1)
+                y = margin_top + chart_height * (1 - (value - minimum) / (maximum - minimum))
+                points.append(f"{x:.2f},{y:.2f}")
+            lines.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2"/>')
+        lines.append("</svg>")
+        path.write_text("\n".join(lines), encoding="utf-8")
 
     def redraw(self) -> None:
         self.delete("all")
@@ -1237,6 +1312,12 @@ class TestStandApp(tk.Tk):
         self.bushing_unit = "degrees" if self.position_calibration else "volts"
         self._display_voltage_samples: deque[float] = deque(maxlen=5)
         self._velocity_angles: deque[float] = deque(maxlen=VELOCITY_SLOPE_WINDOW_SAMPLES)
+        self._snapshot_samples: deque[PositionVelocitySnapshotSample] = deque(maxlen=SNAPSHOT_HISTORY_MAX_SAMPLES)
+        self._snapshot_stream_gap_pending = False
+        self.graphs_paused = False
+        self._frozen_snapshot_samples: tuple[PositionVelocitySnapshotSample, ...] | None = None
+        self._frozen_position_graph: dict[str, object] | None = None
+        self._frozen_velocity_graph: dict[str, object] | None = None
         self.bushing_detail_var = tk.StringVar(value="Waiting for AIN2")
         self.velocity_detail_var = tk.StringVar(value="Calibrate AIN2 to calculate velocity")
         self.cycle_stops_var = tk.StringVar(value=self.cycle_stops_summary())
@@ -1434,9 +1515,18 @@ class TestStandApp(tk.Tk):
         self.chart_holder.columnconfigure(0, weight=1)
         self.chart_holder.columnconfigure(1, weight=1)
         self.chart_holder.columnconfigure(2, weight=1)
-        self.chart_holder.rowconfigure(0, weight=1)
+        self.chart_holder.rowconfigure(1, weight=1)
+        chart_toolbar = ttk.Frame(self.chart_holder)
+        chart_toolbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
+        ttk.Label(chart_toolbar, text="Position and velocity", foreground="#475569").pack(side="left")
+        self.pause_graphs_button = ttk.Button(chart_toolbar, text="Pause", command=self.toggle_graph_pause)
+        self.pause_graphs_button.pack(side="right")
+        self.save_snapshot_button = ttk.Button(
+            chart_toolbar, text="Save Snapshot…", command=self.save_graph_snapshot, state="disabled"
+        )
+        self.save_snapshot_button.pack(side="right", padx=(0, 6))
         self.bushing_plot = LivePlot(self.chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
-        self.bushing_plot.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.bushing_plot.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
         self.configure_bushing_plot(clear_samples=False)
         self.velocity_plot = LivePlot(
             self.chart_holder,
@@ -1445,7 +1535,7 @@ class TestStandApp(tk.Tk):
             "#2563eb",
             minimum=-DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
         )
-        self.velocity_plot.grid(row=0, column=1, sticky="nsew", padx=5)
+        self.velocity_plot.grid(row=1, column=1, sticky="nsew", padx=5)
         self.configure_velocity_plot(clear_samples=False)
         self.pressure_plot = LivePlot(
             self.chart_holder,
@@ -1453,7 +1543,7 @@ class TestStandApp(tk.Tk):
             5000.0,
             "#d97706",
         )
-        self.pressure_plot.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+        self.pressure_plot.grid(row=1, column=2, sticky="nsew", padx=(5, 0))
         self.pressure_plot.set_reference_lines([
             (INJECTOR_ACTIVATION_PSI, "#7c3aed", "Injector activation"),
         ])
@@ -1837,6 +1927,7 @@ class TestStandApp(tk.Tk):
         self.configure_bushing_plot()
         self.configure_velocity_plot()
         self._cycle_capture = None
+        self._clear_snapshot_history()
         self._write_run_configuration_snapshot()
 
     def clear_position_calibration(self) -> None:
@@ -1846,6 +1937,7 @@ class TestStandApp(tk.Tk):
         self.configure_bushing_plot()
         self.configure_velocity_plot()
         self._cycle_capture = None
+        self._clear_snapshot_history()
         self._write_run_configuration_snapshot()
         self.log_event("AIN2 calibration cleared", "Saved two-point AIN2 calibration removed.")
 
@@ -1974,6 +2066,9 @@ class TestStandApp(tk.Tk):
         """Render the latest raw-stream velocity at the same cadence as the position UI."""
         if self.bushing_velocity is None:
             return
+        self.metric_vars["velocity"].set(f"{self.bushing_velocity:+.2f} °/s")
+        if self.graphs_paused:
+            return
         limit = max(abs(self.velocity_plot.minimum), abs(self.velocity_plot.maximum))
         if abs(self.bushing_velocity) > limit * 0.95:
             new_limit = max(DEFAULT_VELOCITY_GRAPH_LIMIT_DPS, (int(abs(self.bushing_velocity) / 25) + 2) * 25.0)
@@ -1981,7 +2076,6 @@ class TestStandApp(tk.Tk):
                 "Live bushing velocity (°/s, calibrated AIN2)", -new_limit, new_limit, clear_samples=False
             )
             self.velocity_plot.set_reference_lines([(0.0, "#94a3b8", "Stationary")])
-        self.metric_vars["velocity"].set(f"{self.bushing_velocity:+.2f} °/s")
         self.velocity_plot.add(self.bushing_velocity)
 
     def _start_cycle_capture(self, retracted: float, extended: float, sample_at: str, sample_monotonic: float) -> None:
@@ -2097,6 +2191,7 @@ class TestStandApp(tk.Tk):
                     self.velocity_detail_var.set("AIN2 stream gap — velocity rearming")
                     if self._cycle_capture is not None:
                         self._cycle_capture.stream_gap_detected = True
+                    self._snapshot_stream_gap_pending = True
                 samples = result.get("samples", [])
                 if not isinstance(samples, list):
                     samples = []
@@ -2132,6 +2227,7 @@ class TestStandApp(tk.Tk):
             angle, outside = self.angle_from_voltage(voltage, self.position_calibration)
             if not outside:
                 self._update_bushing_velocity(angle, scan_rate_hz)
+                self._record_snapshot_sample(sample_at, sample_monotonic, scan_rate_hz, voltage, angle)
                 self._update_cycle_count_from_bushing(angle, sample_at, sample_monotonic)
             else:
                 self._velocity_angles.clear()
@@ -2151,12 +2247,147 @@ class TestStandApp(tk.Tk):
             if outside:
                 detail += " • OUT"
             self.bushing_detail_var.set(detail)
-            self.bushing_plot.add(angle)
+            if not self.graphs_paused:
+                self.bushing_plot.add(angle)
         else:
             self.bushing_position, self.bushing_unit = voltage, "volts"
             self.metric_vars["position"].set(f"{voltage:.4f} V")
             self.bushing_detail_var.set("Live AIN2 voltage • calibration required for angle")
             self.bushing_plot.add(voltage)
+
+    def _record_snapshot_sample(
+        self,
+        sample_at: str,
+        sample_monotonic: float,
+        scan_rate_hz: float,
+        voltage: float,
+        angle: float,
+    ) -> None:
+        """Keep a bounded, calibrated raw-stream history solely for operator snapshots."""
+        self._snapshot_samples.append(
+            PositionVelocitySnapshotSample(
+                timestamp=sample_at,
+                monotonic_seconds=sample_monotonic,
+                scan_rate_hz=scan_rate_hz,
+                ain2_voltage=voltage,
+                position_degrees=angle,
+                velocity_degrees_per_second=self.bushing_velocity,
+                stream_gap_before=self._snapshot_stream_gap_pending,
+            )
+        )
+        self._snapshot_stream_gap_pending = False
+
+    def _clear_snapshot_history(self) -> None:
+        """Discard incompatible raw history after changing the position calibration."""
+        self._snapshot_samples.clear()
+        self._snapshot_stream_gap_pending = False
+        self.graphs_paused = False
+        self._frozen_snapshot_samples = None
+        self._frozen_position_graph = None
+        self._frozen_velocity_graph = None
+        if hasattr(self, "pause_graphs_button"):
+            self.pause_graphs_button.configure(text="Pause")
+            self.save_snapshot_button.configure(state="disabled")
+
+    def toggle_graph_pause(self) -> None:
+        """Freeze only the two bushing charts and a matching high-rate data window."""
+        if self.graphs_paused:
+            self.graphs_paused = False
+            self._frozen_snapshot_samples = None
+            self._frozen_position_graph = None
+            self._frozen_velocity_graph = None
+            self.pause_graphs_button.configure(text="Pause")
+            self.save_snapshot_button.configure(state="disabled")
+            return
+        if not self._snapshot_samples:
+            messagebox.showinfo(
+                "No snapshot data",
+                "Wait for calibrated AIN2 position samples before pausing the graphs.",
+                parent=self,
+            )
+            return
+        self.graphs_paused = True
+        self._frozen_snapshot_samples = tuple(self._snapshot_samples)
+        self._frozen_position_graph = self.bushing_plot.snapshot_state()
+        self._frozen_velocity_graph = self.velocity_plot.snapshot_state()
+        self.pause_graphs_button.configure(text="Resume")
+        self.save_snapshot_button.configure(state="normal")
+        self.log_event(
+            "Graph snapshot paused",
+            f"Frozen {len(self._frozen_snapshot_samples):,} calibrated AIN2 samples for review or export.",
+        )
+
+    def _snapshot_output_root(self) -> Path:
+        """Use the configured test-output location when available, otherwise local app data."""
+        configured_directory = str(self.auto_archive_config.get("directory", "")).strip()
+        if configured_directory:
+            try:
+                candidate = Path(configured_directory)
+                if candidate.is_dir():
+                    return candidate / "snapshots"
+            except OSError:
+                pass
+        return self.paths.root / "snapshots"
+
+    def save_graph_snapshot(self) -> None:
+        """Export the paused full-rate capture and the two frozen graphs as a self-contained folder."""
+        samples = self._frozen_snapshot_samples
+        position_graph, velocity_graph = self._frozen_position_graph, self._frozen_velocity_graph
+        if not self.graphs_paused or not samples or position_graph is None or velocity_graph is None:
+            return
+        output_root = self._snapshot_output_root()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destination = output_root / f"Snapshot_{timestamp}"
+        suffix = 2
+        while destination.exists():
+            destination = output_root / f"Snapshot_{timestamp}_{suffix:02d}"
+            suffix += 1
+        try:
+            output_root.mkdir(parents=True, exist_ok=True)
+            destination.mkdir()
+            data_file = destination / "position_velocity_200hz.csv"
+            first_time = samples[0].monotonic_seconds
+            with data_file.open("w", newline="", encoding="utf-8") as source:
+                writer = csv.writer(source)
+                writer.writerow([
+                    "timestamp",
+                    "elapsed_seconds",
+                    "scan_rate_hz",
+                    "ain2_voltage_volts",
+                    "bushing_position_degrees",
+                    "bushing_velocity_degrees_per_second",
+                    "stream_gap_before",
+                ])
+                for sample in samples:
+                    writer.writerow([
+                        sample.timestamp,
+                        f"{sample.monotonic_seconds - first_time:.6f}",
+                        f"{sample.scan_rate_hz:.3f}",
+                        f"{sample.ain2_voltage:.6f}",
+                        f"{sample.position_degrees:.6f}",
+                        "" if sample.velocity_degrees_per_second is None else f"{sample.velocity_degrees_per_second:.6f}",
+                        "yes" if sample.stream_gap_before else "",
+                    ])
+            LivePlot.write_svg(destination / "position_graph.svg", position_graph)
+            LivePlot.write_svg(destination / "velocity_graph.svg", velocity_graph)
+            metadata = {
+                "schema_version": 1,
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "source": "paused position and velocity dashboard graphs",
+                "sample_count": len(samples),
+                "capture_duration_seconds": round(samples[-1].monotonic_seconds - first_time, 4),
+                "configured_history_seconds": SNAPSHOT_HISTORY_SECONDS,
+                "current_live_run_id": self.current_live_run_id,
+                "position_calibration": self.position_calibration,
+                "cycle_stops": self.cycle_stops,
+                "files": ["position_velocity_200hz.csv", "position_graph.svg", "velocity_graph.svg"],
+            }
+            (destination / "snapshot_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        except (OSError, csv.Error, ValueError) as error:
+            messagebox.showerror("Snapshot export failed", f"Could not save the graph snapshot:\n{error}", parent=self)
+            return
+        self.log_event("Graph snapshot saved", f"{destination.name}: {len(samples):,} full-rate AIN2 samples.")
+        messagebox.showinfo("Snapshot saved", f"Saved {len(samples):,} full-rate samples and both graphs.\n\n{destination}", parent=self)
 
     def open_calibration_window(self) -> None:
         if not self.labjack_available:
