@@ -25,5 +25,11 @@ Python is already included in this package. Do not install Python or run pip.
 The newest application ZIP is always on the project's Releases page:
 https://github.com/leonardx548/Senior-Design/releases/latest
 
+Professor demonstration view
+----------------------------
+In the application, select View > Presentation View (Hide Simulated) to hide
+the simulated grease and temperature controls. Live AIN2 position, cycle
+counting, calibration, exports, and the event log remain visible.
+
 Each computer keeps its own calibration and run logs under:
 %LOCALAPPDATA%\SeniorDesignTestStand

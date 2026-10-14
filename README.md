@@ -10,6 +10,8 @@ This is a small Windows desktop application for the senior-design bushing test s
 
 The release package includes Python and the LabJack Python wrapper; teammates do not need to install Python, create a virtual environment, or run `pip`. The official LabJack LJM Windows driver/library remains a separate installation because it supplies the signed USB driver and native hardware library. The dashboard runs in simulation mode without that driver or a connected T4. Inside the app, **Help → Getting Started…** shows these same steps and links.
 
+For a live-hardware demonstration, use **View → Presentation View (Hide Simulated)**. It removes all grease and temperature placeholders, simulated controls, and the pressure graph while retaining live AIN2 position, cycle counting, calibration, cycle stops, exports, and the event log.
+
 ## Development setup
 
 The source ZIP is for development rather than ordinary operation. Install Python 3.10 or newer from [python.org](https://www.python.org/downloads/) and select **Add Python to PATH**, then double-click [setup_windows.bat](setup_windows.bat). Use [run_diagnostic.bat](run_diagnostic.bat) and [run_test_stand.bat](run_test_stand.bat) to run from source.

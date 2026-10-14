@@ -34,7 +34,7 @@ from labjack_diagnostic import summarize_ain2_samples
 PRESSURE_REACHED_PSI = 2500.0
 PRESSURE_RESET_PSI = 250.0
 UPDATE_MS = 100
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 DEFAULT_SENSOR_LOG_SECONDS = 1.0
 AIN2_POLL_SECONDS = 0.75
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
@@ -906,7 +906,7 @@ class LocalDataDialog(tk.Toplevel):
 class TestStandApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Senior Design Test Stand — Simulation Prototype")
+        self.title("Senior Design Test Stand")
         self.minsize(1040, 720)
         self.geometry("1240x820")
         self.configure(background="#f1f5f9")
@@ -946,6 +946,7 @@ class TestStandApp(tk.Tk):
         self._display_voltage_samples: deque[float] = deque(maxlen=5)
         self.bushing_detail_var = tk.StringVar(value="Waiting for AIN2")
         self.cycle_stops_var = tk.StringVar(value=self.cycle_stops_summary())
+        self.presentation_mode_var = tk.BooleanVar(value=False)
 
         self._build_style()
         self._build_menu()
@@ -1001,10 +1002,45 @@ class TestStandApp(tk.Tk):
         edit_menu = tk.Menu(menu_bar, tearoff=False)
         edit_menu.add_command(label="Advanced Logging…", command=self.open_advanced_logging_window)
         menu_bar.add_cascade(label="Edit", menu=edit_menu)
+        view_menu = tk.Menu(menu_bar, tearoff=False)
+        view_menu.add_checkbutton(
+            label="Presentation View (Hide Simulated)",
+            variable=self.presentation_mode_var,
+            command=self.apply_presentation_mode,
+        )
+        menu_bar.add_cascade(label="View", menu=view_menu)
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="Getting Started…", command=self.open_getting_started_window)
         menu_bar.add_cascade(label="Help", menu=help_menu)
         self.configure(menu=menu_bar)
+
+    def apply_presentation_mode(self) -> None:
+        """Hide simulation-only widgets for a live-hardware demonstration."""
+        presentation = self.presentation_mode_var.get()
+        if presentation:
+            self.header_detail_var.set("Live bushing position and cycle counting from LabJack T4")
+            for frame in self.simulated_metric_frames:
+                frame.grid_remove()
+            self.metrics.rowconfigure(1, weight=0)
+            self.metrics.columnconfigure(3, weight=0, uniform="")
+            self.grease_controls_frame.grid_remove()
+            self.pressure_plot.grid_remove()
+            self.chart_holder.columnconfigure(1, weight=0)
+            self.grease_status_section.pack_forget()
+            self.log_event("Presentation view enabled", "Simulated grease and temperature widgets hidden.")
+        else:
+            self.header_detail_var.set(
+                "Live bushing position from AIN2  •  Grease pressure and temperatures are simulated"
+            )
+            for frame in self.simulated_metric_frames:
+                frame.grid()
+            self.metrics.rowconfigure(1, weight=1)
+            self.metrics.columnconfigure(3, weight=1, uniform="metrics")
+            self.grease_controls_frame.grid()
+            self.pressure_plot.grid()
+            self.chart_holder.columnconfigure(1, weight=1)
+            self.grease_status_section.pack(fill="x", anchor="w", before=self.event_log_label)
+            self.log_event("Presentation view disabled", "Simulation widgets shown.")
 
     def open_getting_started_window(self) -> None:
         """Show concise setup guidance without interrupting normal operation."""
@@ -1068,8 +1104,10 @@ class TestStandApp(tk.Tk):
         title = ttk.Frame(header, style="Header.TFrame")
         title.grid(row=0, column=0, sticky="w")
         ttk.Label(title, text="Senior Design Test Stand", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(title, text="Live bushing position from AIN2  •  Grease pressure and temperatures are simulated",
-                  style="Subheader.TLabel").pack(anchor="w", pady=(3, 0))
+        self.header_detail_var = tk.StringVar(
+            value="Live bushing position from AIN2  •  Grease pressure and temperatures are simulated"
+        )
+        ttk.Label(title, textvariable=self.header_detail_var, style="Subheader.TLabel").pack(anchor="w", pady=(3, 0))
         self.labjack_status_var = tk.StringVar(value="LabJack T4 • Checking connection")
         self.labjack_status_label = ttk.Label(
             header, textvariable=self.labjack_status_var, style="Subheader.TLabel", font=("Segoe UI", 10, "bold")
@@ -1082,22 +1120,24 @@ class TestStandApp(tk.Tk):
         main.columnconfigure(1, weight=2)
         main.rowconfigure(2, weight=1)
 
-        metrics = ttk.Frame(main)
-        metrics.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.metrics = ttk.Frame(main)
+        self.metrics.grid(row=0, column=0, columnspan=2, sticky="ew")
         for column in range(4):
-            metrics.columnconfigure(column, weight=1, uniform="metrics")
+            self.metrics.columnconfigure(column, weight=1, uniform="metrics")
         for row in range(2):
-            metrics.rowconfigure(row, weight=1)
+            self.metrics.rowconfigure(row, weight=1)
 
         self.metric_vars: dict[str, tk.StringVar] = {}
-        self._metric(metrics, 0, 0, "Completed Cycles", "cycles", "0", "Configured cycle stops")
-        self._metric(metrics, 0, 1, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
-        self._metric(metrics, 0, 2, "Cycle Frequency", "frequency", "0.0 cpm", "Rolling 60-second rate")
-        self._metric(metrics, 0, 3, "Grease Pressure", "pressure", "35 psi", "Simulated")
-        self._metric(metrics, 1, 0, "Temperature 1", "temp_1", "72.0 °F", "Simulated")
-        self._metric(metrics, 1, 1, "Temperature 2", "temp_2", "73.0 °F", "Simulated")
-        self._metric(metrics, 1, 2, "Temperature 3", "temp_3", "71.5 °F", "Simulated")
-        self._metric(metrics, 1, 3, "Temperature 4", "temp_4", "72.5 °F", "Simulated")
+        self._metric(self.metrics, 0, 0, "Completed Cycles", "cycles", "0", "Configured cycle stops")
+        self._metric(self.metrics, 0, 1, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
+        self._metric(self.metrics, 0, 2, "Cycle Frequency", "frequency", "0.0 cpm", "Rolling 60-second rate")
+        self.simulated_metric_frames = [
+            self._metric(self.metrics, 0, 3, "Grease Pressure", "pressure", "35 psi", "Simulated"),
+            self._metric(self.metrics, 1, 0, "Temperature 1", "temp_1", "72.0 °F", "Simulated"),
+            self._metric(self.metrics, 1, 1, "Temperature 2", "temp_2", "72.5 °F", "Simulated"),
+            self._metric(self.metrics, 1, 2, "Temperature 3", "temp_3", "71.5 °F", "Simulated"),
+            self._metric(self.metrics, 1, 3, "Temperature 4", "temp_4", "72.5 °F", "Simulated"),
+        ]
 
         controls = ttk.LabelFrame(main, text="Test Controls", padding=12)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 10))
@@ -1115,30 +1155,32 @@ class TestStandApp(tk.Tk):
         self.stop_button.pack(side="left", padx=(6, 0))
         self.reset_button = ttk.Button(count_buttons, text="Reset", command=self.reset_counting)
         self.reset_button.pack(side="left", padx=(6, 0))
-        ttk.Label(controls, text="Grease every").grid(row=0, column=1, sticky="e")
+        self.grease_controls_frame = ttk.Frame(controls)
+        self.grease_controls_frame.grid(row=0, column=1, columnspan=6, sticky="ew")
+        ttk.Label(self.grease_controls_frame, text="Grease every").grid(row=0, column=0, sticky="e")
         self.interval_var = tk.StringVar(value="10")
-        ttk.Spinbox(controls, from_=0.1, to=100000, increment=1, textvariable=self.interval_var,
-                    width=9).grid(row=0, column=2, padx=5)
+        ttk.Spinbox(self.grease_controls_frame, from_=0.1, to=100000, increment=1, textvariable=self.interval_var,
+                    width=9).grid(row=0, column=1, padx=5)
         self.interval_unit_var = tk.StringVar(value="minutes")
         ttk.Combobox(
-            controls, textvariable=self.interval_unit_var, state="readonly", width=9,
+            self.grease_controls_frame, textvariable=self.interval_unit_var, state="readonly", width=9,
             values=("seconds", "minutes"),
-        ).grid(row=0, column=3, sticky="w")
-        ttk.Button(controls, text="Apply", command=self.apply_interval).grid(row=0, column=4, padx=(6, 18))
-        self.grease_button = ttk.Button(controls, text="Grease Now", style="Grease.TButton",
+        ).grid(row=0, column=2, sticky="w")
+        ttk.Button(self.grease_controls_frame, text="Apply", command=self.apply_interval).grid(row=0, column=3, padx=(6, 18))
+        self.grease_button = ttk.Button(self.grease_controls_frame, text="Grease Now", style="Grease.TButton",
                                         command=self.manual_grease)
-        self.grease_button.grid(row=0, column=5, padx=(0, 12))
+        self.grease_button.grid(row=0, column=4, padx=(0, 12))
 
-        ttk.Label(controls, text="Next lubrication:").grid(row=1, column=0, columnspan=2,
-                                                                        sticky="w", pady=(10, 0))
+        ttk.Label(self.grease_controls_frame, text="Next lubrication:").grid(row=1, column=0, columnspan=2,
+                                                                               sticky="w", pady=(10, 0))
         self.next_lube_var = tk.StringVar()
-        ttk.Label(controls, textvariable=self.next_lube_var, font=("Segoe UI", 10, "bold")).grid(
+        ttk.Label(self.grease_controls_frame, textvariable=self.next_lube_var, font=("Segoe UI", 10, "bold")).grid(
             row=1, column=2, columnspan=2, sticky="w", pady=(10, 0)
         )
-        ttk.Label(controls, text="Simulated outcome:").grid(row=1, column=4, sticky="e", pady=(10, 0))
+        ttk.Label(self.grease_controls_frame, text="Simulated outcome:").grid(row=1, column=4, sticky="e", pady=(10, 0))
         self.outcome_var = tk.StringVar(value=self.grease_outcome)
         outcome = ttk.Combobox(
-            controls,
+            self.grease_controls_frame,
             textvariable=self.outcome_var,
             state="readonly",
             width=31,
@@ -1167,23 +1209,27 @@ class TestStandApp(tk.Tk):
             row=3, column=2, columnspan=4, sticky="w", pady=(10, 0)
         )
 
-        chart_holder = ttk.Frame(main)
-        chart_holder.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
-        chart_holder.columnconfigure(0, weight=1)
-        chart_holder.columnconfigure(1, weight=1)
-        chart_holder.rowconfigure(0, weight=1)
-        self.bushing_plot = LivePlot(chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
+        self.chart_holder = ttk.Frame(main)
+        self.chart_holder.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
+        self.chart_holder.columnconfigure(0, weight=1)
+        self.chart_holder.columnconfigure(1, weight=1)
+        self.chart_holder.rowconfigure(0, weight=1)
+        self.bushing_plot = LivePlot(self.chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
         self.bushing_plot.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.configure_bushing_plot(clear_samples=False)
-        self.pressure_plot = LivePlot(chart_holder, "Simulated grease pressure (psi)", 5000, "#d97706")
+        self.pressure_plot = LivePlot(self.chart_holder, "Simulated grease pressure (psi)", 5000, "#d97706")
         self.pressure_plot.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
-        status_box = ttk.LabelFrame(main, text="Greasing Status (Simulated)", padding=12)
+        status_box = ttk.LabelFrame(main, text="Test Activity", padding=12)
         status_box.grid(row=2, column=1, sticky="nsew")
         self.grease_status_var = tk.StringVar(value=self.grease_phase)
-        ttk.Label(status_box, textvariable=self.grease_status_var, wraplength=330,
+        self.grease_status_section = ttk.Frame(status_box)
+        self.grease_status_section.pack(fill="x", anchor="w")
+        ttk.Label(self.grease_status_section, text="Greasing (simulated)", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(self.grease_status_section, textvariable=self.grease_status_var, wraplength=330,
                   font=("Segoe UI", 12, "bold"), foreground="#1e3a8a").pack(anchor="w")
-        ttk.Label(status_box, text="Event Log", font=("Segoe UI", 10, "bold"), background="#ffffff").pack(
+        self.event_log_label = ttk.Label(status_box, text="Event Log", font=("Segoe UI", 10, "bold"), background="#ffffff")
+        self.event_log_label.pack(
             anchor="w", pady=(12, 4)
         )
         self.event_log = ScrolledText(status_box, height=14, wrap="word", state="disabled",
@@ -1193,7 +1239,7 @@ class TestStandApp(tk.Tk):
 
     def _metric(
         self, parent: ttk.Frame, row: int, column: int, label: str, key: str, initial: str, detail: str | tk.StringVar
-    ) -> None:
+    ) -> ttk.Frame:
         frame = ttk.Frame(parent, style="Metric.TFrame", padding=(12, 10))
         frame.grid(
             row=row, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0), pady=(0 if row == 0 else 5, 0)
@@ -1206,6 +1252,7 @@ class TestStandApp(tk.Tk):
             ttk.Label(frame, textvariable=detail, style="MetricDetail.TLabel", wraplength=155).pack(anchor="w")
         else:
             ttk.Label(frame, text=detail, style="MetricDetail.TLabel", wraplength=155).pack(anchor="w")
+        return frame
 
     def log_event(self, event: str, detail: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1748,7 +1795,7 @@ class TestStandApp(tk.Tk):
         if self.is_running:
             self.log_event("Live run interrupted", "Application closed while cycle counting was active.")
             self._finish_live_run("interrupted_by_application_close")
-        self.log_event("Application closed", "Operator closed the simulation prototype.")
+        self.log_event("Application closed", "Operator closed the application.")
         self.ain2_monitor.close()
         self.logger.finalize(
             completed_cycles=self.cycles,
