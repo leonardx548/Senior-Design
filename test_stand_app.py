@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.3.7"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -66,6 +66,7 @@ EXPORT_FILE_OPTIONS = (
     ("metadata", "Run metadata", "live_run.json"),
     ("configuration", "Run configuration", "run_configuration.json"),
 )
+DEFAULT_AUTO_ARCHIVE_INCLUDE = ("cycles", "grease")
 
 
 def auto_archive_interval_label(interval_seconds: int) -> str:
@@ -1063,7 +1064,7 @@ class AutoArchiveDialog(tk.Toplevel):
             self.status_var.set(f"Archives are created after each active {self.interval_var.get().lower()}.")
 
     def _build(self) -> None:
-        outer = ttk.Frame(self, padding=18)
+        outer = ttk.Frame(self, padding=14)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="Automatic test archives", font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(
@@ -1075,16 +1076,16 @@ class AutoArchiveDialog(tk.Toplevel):
             ),
             wraplength=700,
             foreground="#475569",
-        ).pack(anchor="w", pady=(5, 14))
+        ).pack(anchor="w", pady=(4, 10))
 
         ttk.Checkbutton(
             outer,
             text="Automatically archive active test data",
             variable=self.enabled_var,
-        ).pack(anchor="w", pady=(0, 12))
+        ).pack(anchor="w", pady=(0, 8))
 
         timing = ttk.LabelFrame(outer, text="Archive interval", padding=10)
-        timing.pack(fill="x", pady=(0, 12))
+        timing.pack(fill="x", pady=(0, 8))
         ttk.Label(timing, text="Create an archive every").pack(side="left")
         ttk.Combobox(
             timing,
@@ -1102,19 +1103,19 @@ class AutoArchiveDialog(tk.Toplevel):
         ttk.Button(directory, text="Choose Folder…", command=self.choose_directory).grid(row=0, column=1, padx=(8, 0))
 
         options = ttk.LabelFrame(outer, text="Include in each ZIP", padding=10)
-        options.pack(fill="x", pady=(12, 8))
+        options.pack(fill="x", pady=(8, 6))
         for index, (key, label, _filename) in enumerate(EXPORT_FILE_OPTIONS):
             ttk.Checkbutton(options, text=label, variable=self.option_vars[key]).grid(
-                row=index // 2, column=index % 2, sticky="w", padx=(0, 28), pady=2
+                row=index // 3, column=index % 3, sticky="w", padx=(0, 22), pady=2
             )
         ttk.Label(
             options,
-            text="A manifest and the run's captured configuration are included when selected.",
+            text="The archive manifest is included automatically.",
             foreground="#475569",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
 
         ttk.Label(outer, textvariable=self.status_var, foreground="#1e3a8a", wraplength=700).pack(
-            anchor="w", pady=(6, 8)
+            anchor="w", pady=(4, 6)
         )
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x")
@@ -1674,7 +1675,7 @@ class TestStandApp(tk.Tk):
         return {
             "enabled": False,
             "directory": "",
-            "include": [key for key, _label, _file in EXPORT_FILE_OPTIONS],
+            "include": list(DEFAULT_AUTO_ARCHIVE_INCLUDE),
             "interval_seconds": AUTO_ARCHIVE_INTERVAL_SECONDS,
         }
 
