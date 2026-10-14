@@ -4,11 +4,11 @@ This is a small Windows desktop application for the senior-design bushing test s
 
 ## Quick start for teammates
 
-1. Download and extract the **Windows application ZIP** from the GitHub Release page.
+1. Download and extract the **Windows application ZIP** from the [latest GitHub Release](https://github.com/leonardx548/Senior-Design/releases/latest).
 2. Double-click `TestStand.exe`.
-3. For a computer using the physical T4, install the official LabJack LJM Windows driver/library once, connect the T4, then run `TestStandLabJackDiagnostic.exe` to confirm the USB connection.
+3. For a computer using the physical T4, install the [official LabJack LJM Windows driver/library](https://support.labjack.com/docs/ljm-software-installer-windows) once, connect the T4, then run `TestStandLabJackDiagnostic.exe` to confirm the USB connection.
 
-The release package includes Python and the LabJack Python wrapper; teammates do not need to install Python, create a virtual environment, or run `pip`. The official LabJack LJM Windows driver/library remains a separate installation because it supplies the signed USB driver and native hardware library. The dashboard runs in simulation mode without that driver or a connected T4.
+The release package includes Python and the LabJack Python wrapper; teammates do not need to install Python, create a virtual environment, or run `pip`. The official LabJack LJM Windows driver/library remains a separate installation because it supplies the signed USB driver and native hardware library. The dashboard runs in simulation mode without that driver or a connected T4. Inside the app, **Help → Getting Started…** shows these same steps and links.
 
 ## Development setup
 

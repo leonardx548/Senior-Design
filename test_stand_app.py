@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 import zipfile
 from collections import deque
 from datetime import datetime
@@ -33,12 +34,14 @@ from labjack_diagnostic import summarize_ain2_samples
 PRESSURE_REACHED_PSI = 2500.0
 PRESSURE_RESET_PSI = 250.0
 UPDATE_MS = 100
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 DEFAULT_SENSOR_LOG_SECONDS = 1.0
 AIN2_POLL_SECONDS = 0.75
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
 MIN_CYCLE_STOP_SEPARATION_DEGREES = 1.0
 CALIBRATION_STREAM_SAMPLE_COUNT = 100
+LABJACK_LJM_WINDOWS_URL = "https://support.labjack.com/docs/ljm-software-installer-windows"
+GITHUB_RELEASES_URL = "https://github.com/leonardx548/Senior-Design/releases/latest"
 
 
 def format_local_timestamp(value: object, fallback: str = "Not available") -> str:
@@ -998,7 +1001,65 @@ class TestStandApp(tk.Tk):
         edit_menu = tk.Menu(menu_bar, tearoff=False)
         edit_menu.add_command(label="Advanced Logging…", command=self.open_advanced_logging_window)
         menu_bar.add_cascade(label="Edit", menu=edit_menu)
+        help_menu = tk.Menu(menu_bar, tearoff=False)
+        help_menu.add_command(label="Getting Started…", command=self.open_getting_started_window)
+        menu_bar.add_cascade(label="Help", menu=help_menu)
         self.configure(menu=menu_bar)
+
+    def open_getting_started_window(self) -> None:
+        """Show concise setup guidance without interrupting normal operation."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Getting Started")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        outer = ttk.Frame(dialog, padding=24)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Set up this test station", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="The application is ready to run without a Python installation. "
+                 "The LabJack driver is only needed for live position and cycle counting.",
+            wraplength=600,
+            foreground="#475569",
+        ).pack(anchor="w", pady=(6, 18))
+
+        ttk.Label(outer, text="To use the physical LabJack T4", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text=(
+                "1. Install the official LabJack LJM Windows driver/library.\n"
+                "2. Connect the T4 by USB.\n"
+                "3. Restart this application. The header will show “LabJack T4 • Connected • USB”.\n"
+                "4. If it remains disconnected, run TestStandLabJackDiagnostic.exe from the release folder."
+            ),
+            justify="left",
+            wraplength=600,
+        ).pack(anchor="w", pady=(6, 16))
+
+        ttk.Label(outer, text="Data and calibration", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="Each computer stores its own calibration and exported-run history under "
+                 "%LOCALAPPDATA%\\SeniorDesignTestStand. Use File → Export Runs… to create shareable ZIP files.",
+            justify="left",
+            wraplength=600,
+        ).pack(anchor="w", pady=(6, 18))
+
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x")
+        ttk.Button(
+            buttons,
+            text="Open LabJack Driver Download",
+            command=lambda: webbrowser.open_new_tab(LABJACK_LJM_WINDOWS_URL),
+        ).pack(side="left")
+        ttk.Button(
+            buttons,
+            text="Open Latest Release",
+            command=lambda: webbrowser.open_new_tab(GITHUB_RELEASES_URL),
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side="right")
 
     def _build_interface(self) -> None:
         header = ttk.Frame(self, style="Header.TFrame", padding=(24, 15))
