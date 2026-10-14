@@ -383,7 +383,6 @@ class PositionCalibrationDialog(tk.Toplevel):
             side="left"
         )
         ttk.Button(buttons, text="Clear Saved Calibration", command=self.clear_calibration).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Close", command=self.close).pack(side="right")
 
     def close(self) -> None:
         if self._sampling:
@@ -580,7 +579,6 @@ class CycleStopsDialog(tk.Toplevel):
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Save Cycle Stops", style="Grease.TButton", command=self.save).pack(side="left")
         ttk.Button(buttons, text="Clear Stops", command=self.clear).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
 
     def use_current(self, target: str) -> None:
         self.current_var.set(self._current_position_text())
@@ -759,7 +757,6 @@ class ExportDataDialog(tk.Toplevel):
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Advanced Logging…", command=self.app.open_advanced_logging_window).pack(side="left")
         ttk.Button(buttons, text="Export Selected…", style="Grease.TButton", command=self.export).pack(side="right")
-        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right", padx=(0, 8))
 
     def refresh_runs(self) -> None:
         self.app.logger.flush()
@@ -975,7 +972,6 @@ class LocalDataDialog(tk.Toplevel):
         ttk.Button(buttons, text="Delete Selected…", style="Stop.TButton", command=self.delete_selected).pack(
             side="right"
         )
-        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right", padx=(0, 8))
 
     @staticmethod
     def _folder_size(folder: Path) -> int:
@@ -1069,7 +1065,6 @@ class EventTerminalDialog(tk.Toplevel):
             text="Read-only live activity from this application session",
             foreground="#475569",
         ).pack(side="left", padx=12)
-        ttk.Button(header, text="Close", command=self.destroy).pack(side="right")
         self.output = ScrolledText(
             outer,
             wrap="word",
@@ -1247,7 +1242,6 @@ class TestStandApp(tk.Tk):
             text="Open Latest Release",
             command=lambda: webbrowser.open_new_tab(GITHUB_RELEASES_URL),
         ).pack(side="left", padx=(8, 0))
-        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side="right")
 
     def _build_interface(self) -> None:
         header = ttk.Frame(self, style="Header.TFrame", padding=(24, 15))
