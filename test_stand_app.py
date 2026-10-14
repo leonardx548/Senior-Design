@@ -1016,6 +1016,7 @@ class TestStandApp(tk.Tk):
         style.map("Stop.TButton", background=[("active", "#dc2626")])
         style.configure("Grease.TButton", background="#1d4ed8", foreground="white")
         style.map("Grease.TButton", background=[("active", "#2563eb")])
+        style.configure("Icon.TButton", font=("Segoe UI Symbol", 11), padding=(3, 1))
         style.configure("TLabelframe", background="#ffffff", bordercolor="#cbd5e1")
         style.configure("TLabelframe.Label", background="#ffffff", foreground="#0f172a",
                         font=("Segoe UI", 10, "bold"))
@@ -1189,7 +1190,13 @@ class TestStandApp(tk.Tk):
         event_toolbar = ttk.Frame(status_box)
         event_toolbar.pack(fill="x", pady=(0, 6))
         ttk.Label(event_toolbar, text="Latest application activity", foreground="#475569").pack(side="left")
-        ttk.Button(event_toolbar, text="Expand…", command=self.open_event_terminal).pack(side="right")
+        ttk.Button(
+            event_toolbar,
+            text="⛶",
+            width=3,
+            style="Icon.TButton",
+            command=self.open_event_terminal,
+        ).pack(side="right")
         self.event_log = ScrolledText(status_box, height=9, wrap="word", state="disabled",
                                       font=("Consolas", 9), background="#f8fafc", foreground="#1e293b",
                                       relief="flat")
