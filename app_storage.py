@@ -122,14 +122,14 @@ class CsvLogger:
                 "bushing_position",
                 "bushing_position_unit",
                 "ain2_voltage_volts",
-                "simulated_pressure_psi",
-                "simulated_temperature_1_f",
-                "simulated_temperature_2_f",
-                "simulated_temperature_3_f",
-                "simulated_temperature_4_f",
+                "grease_pressure_psi",
+                "temperature_1_f",
+                "temperature_2_f",
+                "temperature_3_f",
+                "temperature_4_f",
                 "completed_cycles",
                 "cycle_frequency_cpm",
-                "grease_status",
+                "auxiliary_input_status",
             ]
         )
         self.events.writerow(["timestamp", "live_run_id", "event", "detail", "completed_cycles"])
@@ -270,14 +270,14 @@ class CsvLogger:
                 values["bushing_position"],
                 values["bushing_position_unit"],
                 values["ain2_voltage"],
-                f"{values['pressure']:.1f}",
-                f"{values['temp_1']:.2f}",
-                f"{values['temp_2']:.2f}",
-                f"{values['temp_3']:.2f}",
-                f"{values['temp_4']:.2f}",
+                values["pressure"],
+                values["temp_1"],
+                values["temp_2"],
+                values["temp_3"],
+                values["temp_4"],
                 values["cycles"],
                 f"{values['frequency']:.2f}",
-                values["grease_status"],
+                values["auxiliary_status"],
             ]
         )
         self.sensor_file.flush()

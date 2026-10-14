@@ -1,6 +1,6 @@
-# Senior Design Test Stand — Interface Prototype
+# Senior Design Test Stand
 
-This is a small Windows desktop application for the senior-design bushing test stand. It uses the physical LabJack T4 read-only AIN2 signal for bushing position; the grease and temperature portions remain simulated.
+This Windows desktop application uses the physical LabJack T4 read-only AIN2 signal for bushing position and cycle counting. The dashboard also reserves a grease-pressure channel and four temperature channels for future hardware inputs; it does not generate placeholder readings for them.
 
 ## Quick start for teammates
 
@@ -8,9 +8,7 @@ This is a small Windows desktop application for the senior-design bushing test s
 2. Double-click `TestStand.exe`.
 3. For a computer using the physical T4, install the [official LabJack LJM Windows driver/library](https://support.labjack.com/docs/ljm-software-installer-windows) once, connect the T4, then run `TestStandLabJackDiagnostic.exe` to confirm the USB connection.
 
-The release package includes Python and the LabJack Python wrapper; teammates do not need to install Python, create a virtual environment, or run `pip`. The official LabJack LJM Windows driver/library remains a separate installation because it supplies the signed USB driver and native hardware library. The dashboard runs in simulation mode without that driver or a connected T4. Inside the app, **Help → Getting Started…** shows these same steps and links.
-
-For a live-hardware demonstration, use **View → Presentation View (Hide Simulated)**. It removes all grease and temperature placeholders, simulated controls, and the pressure graph while retaining live AIN2 position, cycle counting, calibration, cycle stops, exports, and the event log.
+The release package includes Python and the LabJack Python wrapper; teammates do not need to install Python, create a virtual environment, or run `pip`. The official LabJack LJM Windows driver/library remains a separate installation because it supplies the signed USB driver and native hardware library. Without a connected T4, the app stays open but disables actions that require its live AIN2 feed. Inside the app, **Help → Getting Started…** shows these same steps and links.
 
 ## Development setup
 
@@ -48,7 +46,7 @@ Calibration and cycle stops are specific to the physical test stand, so they are
 The application always keeps a complete local history for each launch, including time before/after cycle counting. Within that history, a **live run** begins when you press **Start Counting** and ends when you press **Stop**, Reset while counting, a LabJack disconnect, or application close. Use **File → Export Runs…** to select one or more of those live runs and create a portable ZIP. Toggle exactly what to include:
 
 - `sensor_readings.csv` — timestamped dashboard measurements;
-- `events.csv` — cycle detections, connection changes, and simulated grease-command outcomes;
+- `events.csv` — cycle detections, connection changes, and application events;
 - live-run metadata — start/end status, cycle totals, and whether it has been exported; and
 - `run_configuration.json` — the calibration, cycle stops, grease interval, and logging setup captured when that live run started.
 
@@ -66,17 +64,17 @@ To check the connected T4 without reading sensors or changing outputs, run this 
 python labjack_diagnostic.py
 ```
 
-It checks that Windows can see a connected LabJack T4, reports the installed LJM Python/native-library versions, opens the T4 on USB with the official `labjack-ljm` library, prints the LJM handle information, and closes it immediately. The actual open happens in a short-lived child process so a native driver failure cannot close the simulation GUI. It is not tied to a particular laptop or serial number: any Windows computer with the official LabJack T4 driver and LJM library can use it.
+It checks that Windows can see a connected LabJack T4, reports the installed LJM Python/native-library versions, opens the T4 on USB with the official `labjack-ljm` library, prints the LJM handle information, and closes it immediately. The actual open happens in a short-lived child process so a native driver failure cannot close the dashboard. It is not tied to a particular laptop or serial number: any Windows computer with the official LabJack T4 driver and LJM library can use it.
 
 When the dashboard is running, its live AIN2 reader is also the connection check. The header changes between **Connected** and **Connection error** from that same single read path, avoiding competing USB connections. It never writes a register or commands an output.
 
-Until that read path confirms a connected T4, **Start Counting**, **Calibrate AIN2 Position**, and **Input Cycle Stops** are disabled. If the T4 is unplugged while counting, the app pauses counting automatically and preserves the displayed totals for inspection. Reset and the explicitly simulated grease controls remain available.
+Until that read path confirms a connected T4, **Start Counting**, **Calibrate AIN2 Position**, and **Input Cycle Stops** are disabled. If the T4 is unplugged while counting, the app pauses counting automatically and preserves the displayed totals for inspection.
 
 ## AIN2 bushing-position calibration
 
 Use **Calibrate AIN2 Position** in the dashboard to create a two-point calibration for the string potentiometer. Enter the known bushing angle at each of two positions, hold the mechanism stationary, and capture each point. A capture uses 100 fresh samples from the same live AIN2 stream used by the dashboard, over about half a second. It removes brief outliers and rejects a signal that is moving or too noisy. The saved calibration linearly interpolates voltage to angle; a preview warns if its voltage is outside the calibrated span.
 
-The dashboard's **Bushing Position** card and left live graph use this real AIN2 feed, not a simulated cylinder-position signal. A persistent read-only helper uses the T4's hardware-timed AIN2 stream at 200 samples/second for cycle detection. Every received sample is processed in order for counting; only the displayed card and graph use a five-sample average. Before calibration, the dashboard shows measured AIN2 voltage; after calibration, it shows interpolated bushing angle.
+The dashboard's **Bushing Position** card and left live graph use this real AIN2 feed, not a generated cylinder-position signal. A persistent read-only helper uses the T4's hardware-timed AIN2 stream at 200 samples/second for cycle detection. Every received sample is processed in order for counting; only the displayed card and graph use a five-sample average. Before calibration, the dashboard shows measured AIN2 voltage; after calibration, it shows interpolated bushing angle.
 
 ## AIN2 cycle stops and real cycle counting
 
@@ -90,27 +88,24 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 
 ## What the prototype demonstrates
 
-- A readable operator dashboard with real AIN2 bushing position, real stop-based cycle detection, frequency, simulated grease-line pressure, and four placeholder temperature channels.
+- A readable operator dashboard with real AIN2 bushing position, real stop-based cycle detection, frequency, and reserved grease-pressure and temperature channels.
 - Directional cycle detection using two saved angular stops and hysteresis—not a timer counter.
 - Separate **Start Counting**, **Stop**, and **Reset** controls for cycle counting only. Start and Stop preserve the accumulated cycle total and its rolling CPM history; Reset clears both and re-arms the detector. None controls a pneumatic cylinder.
-- Configurable automatic grease interval based on active test-session time (seconds or minutes), plus a manual simulated grease command.
-- Three selectable manual outcomes: successful pressure sequence, insufficient pressure rise, and insufficient reset after venting.
-- A clearly labeled status/event log and two compact live plots.
+- A clearly labeled event log and live bushing-position plot.
 - Per-run CSV output in `%LOCALAPPDATA%\SeniorDesignTestStand\logs\session_YYYYMMDD_HHMMSS\`:
   - `sensor_readings.csv` records timestamped readings at the configurable standard snapshot interval (one second by default), with the active live-run ID when applicable.
-  - `events.csv` records cycle detections, grease commands/outcomes, and program events, with the active live-run ID when applicable.
+  - `events.csv` records cycle detections, connection changes, and program events, with the active live-run ID when applicable.
   - `live_runs.json` defines the Start-to-Stop export boundaries and preserves each run's starting configuration.
   - `run_manifest.json` and `run_configuration.json` describe the complete application session.
 
 ## Important limits
 
-- The AIN2 bushing-position reading and its derived cycle count are real, read-only T4 measurements. Grease pressure, solenoid commands, all four temperature channels, and grease results are simulated. The diagnostic utility only opens a read-only T4 connection to identify the device; it does not read channels or control outputs.
-- The pressure values, timing, and pass/fail limits are demonstration values only; physical testing must establish the real settings.
-- A successful result means the simulated *common grease-line pressure sequence* rose and reset. It does **not** verify delivery through each individual injector.
+- The AIN2 bushing-position reading and its derived cycle count are real, read-only T4 measurements. Grease pressure, solenoid commands, and all four temperature channels are not yet connected or implemented. Their dashboard cards stay visible and report "Input not configured" until that hardware work is completed.
+- The diagnostic utility only opens a read-only T4 connection to identify the device; it does not read auxiliary channels or control outputs.
 
 ## Preparing a GitHub Release
 
-Commit the source files, README, batch files, `requirements.txt`, `build_release.bat`, and `RELEASE_README.txt`; do not add `position_calibration.json`, `cycle_stops.json`, `.venv`, build folders, release ZIPs, or local logs. On the project maintainer's Windows computer, run `build_release.bat`. It creates `release\\SeniorDesignTestStand-v0.1.0-windows.zip`, containing `TestStand.exe`, its bundled runtime files, and the LabJack diagnostic helper. Attach that ZIP to a GitHub Release created from the matching version tag. Each computer creates its own local calibration and run-log folder on first launch.
+Commit the source files, README, batch files, `requirements.txt`, `build_release.bat`, and `RELEASE_README.txt`; do not add `position_calibration.json`, `cycle_stops.json`, `.venv`, build folders, release ZIPs, or local logs. On the project maintainer's Windows computer, run `build_release.bat`. It creates the versioned Windows ZIP named in that script, containing `TestStand.exe`, its bundled runtime files, and the LabJack diagnostic helper. Attach that ZIP to a GitHub Release created from the matching version tag. Each computer creates its own local calibration and run-log folder on first launch.
 
 ## Next practical step when hardware arrives
 

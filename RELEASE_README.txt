@@ -9,7 +9,8 @@ Start the application
 
 Physical LabJack T4 operation
 -----------------------------
-The application will run in simulation mode on any Windows computer.
+The application opens on any Windows computer. It does not generate
+placeholder sensor values.
 
 For live bushing position and cycle counting:
 1. Install the official LabJack LJM Windows driver/library once on this
@@ -25,11 +26,12 @@ Python is already included in this package. Do not install Python or run pip.
 The newest application ZIP is always on the project's Releases page:
 https://github.com/leonardx548/Senior-Design/releases/latest
 
-Professor demonstration view
-----------------------------
-In the application, select View > Presentation View (Hide Simulated) to hide
-the simulated grease and temperature controls. Live AIN2 position, cycle
-counting, calibration, exports, and the event log remain visible.
+Auxiliary channels
+------------------
+The dashboard includes one grease-pressure card and four temperature cards so
+the hardware inputs have a defined operator display. Until those inputs are
+implemented, each card reports "Input not configured" rather than a fake
+reading.
 
 Each computer keeps its own calibration and run logs under:
 %LOCALAPPDATA%\SeniorDesignTestStand

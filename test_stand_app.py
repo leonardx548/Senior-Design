@@ -1,16 +1,15 @@
 """Senior Design Test Stand interface with live read-only LabJack T4 AIN2 position.
 
-The bushing position and cycle count can use the physical string potentiometer.
-Grease pressure and temperature signals remain simulated operator-interface data.
+The bushing position and cycle count use the physical string potentiometer.
+Auxiliary pressure and temperature channels stay visible until their hardware
+inputs are configured; the application never generates placeholder readings.
 """
 
 from __future__ import annotations
 
 import json
 import csv
-import math
 import os
-import random
 import statistics
 import subprocess
 import sys
@@ -31,10 +30,8 @@ from app_storage import AppPaths, CsvLogger
 from labjack_diagnostic import summarize_ain2_samples
 
 
-PRESSURE_REACHED_PSI = 2500.0
-PRESSURE_RESET_PSI = 250.0
 UPDATE_MS = 100
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.3"
 DEFAULT_SENSOR_LOG_SECONDS = 1.0
 AIN2_POLL_SECONDS = 0.75
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
@@ -915,25 +912,11 @@ class TestStandApp(tk.Tk):
         self.logger = CsvLogger(self.paths.logs)
         self.is_running = False
         self.current_live_run_id: str | None = None
-        self.simulation_elapsed = 0.0
-        self.last_tick = time.monotonic()
         self.last_sensor_log = 0.0
         self.sensor_log_interval_seconds = DEFAULT_SENSOR_LOG_SECONDS
-        self.pressure = 35.0
-        self.temperature_1 = 72.0
-        self.temperature_2 = 73.0
-        self.temperature_3 = 71.5
-        self.temperature_4 = 72.5
         self.cycles = 0
         self.cycle_state = "waiting_for_retracted"
         self.cycle_times: deque[float] = deque()
-        self.grease_interval_seconds = 10 * 60.0
-        self.next_grease_time_seconds = self.grease_interval_seconds
-        self.grease_phase = "Idle (simulated)"
-        self.grease_started = 0.0
-        self.vent_started = 0.0
-        self.pressure_at_vent = 35.0
-        self.grease_outcome = "Successful pressure sequence"
         self.position_calibration = self.load_position_calibration()
         self.cycle_stops = self.load_cycle_stops()
         self.ain2_monitor = LabJackAin2Monitor()
@@ -946,7 +929,6 @@ class TestStandApp(tk.Tk):
         self._display_voltage_samples: deque[float] = deque(maxlen=5)
         self.bushing_detail_var = tk.StringVar(value="Waiting for AIN2")
         self.cycle_stops_var = tk.StringVar(value=self.cycle_stops_summary())
-        self.presentation_mode_var = tk.BooleanVar(value=False)
 
         self._build_style()
         self._build_menu()
@@ -1002,45 +984,10 @@ class TestStandApp(tk.Tk):
         edit_menu = tk.Menu(menu_bar, tearoff=False)
         edit_menu.add_command(label="Advanced Logging…", command=self.open_advanced_logging_window)
         menu_bar.add_cascade(label="Edit", menu=edit_menu)
-        view_menu = tk.Menu(menu_bar, tearoff=False)
-        view_menu.add_checkbutton(
-            label="Presentation View (Hide Simulated)",
-            variable=self.presentation_mode_var,
-            command=self.apply_presentation_mode,
-        )
-        menu_bar.add_cascade(label="View", menu=view_menu)
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="Getting Started…", command=self.open_getting_started_window)
         menu_bar.add_cascade(label="Help", menu=help_menu)
         self.configure(menu=menu_bar)
-
-    def apply_presentation_mode(self) -> None:
-        """Hide simulation-only widgets for a live-hardware demonstration."""
-        presentation = self.presentation_mode_var.get()
-        if presentation:
-            self.header_detail_var.set("Live bushing position and cycle counting from LabJack T4")
-            for frame in self.simulated_metric_frames:
-                frame.grid_remove()
-            self.metrics.rowconfigure(1, weight=0)
-            self.metrics.columnconfigure(3, weight=0, uniform="")
-            self.grease_controls_frame.grid_remove()
-            self.pressure_plot.grid_remove()
-            self.chart_holder.columnconfigure(1, weight=0)
-            self.grease_status_section.pack_forget()
-            self.log_event("Presentation view enabled", "Simulated grease and temperature widgets hidden.")
-        else:
-            self.header_detail_var.set(
-                "Live bushing position from AIN2  •  Grease pressure and temperatures are simulated"
-            )
-            for frame in self.simulated_metric_frames:
-                frame.grid()
-            self.metrics.rowconfigure(1, weight=1)
-            self.metrics.columnconfigure(3, weight=1, uniform="metrics")
-            self.grease_controls_frame.grid()
-            self.pressure_plot.grid()
-            self.chart_holder.columnconfigure(1, weight=1)
-            self.grease_status_section.pack(fill="x", anchor="w", before=self.event_log_label)
-            self.log_event("Presentation view disabled", "Simulation widgets shown.")
 
     def open_getting_started_window(self) -> None:
         """Show concise setup guidance without interrupting normal operation."""
@@ -1105,7 +1052,7 @@ class TestStandApp(tk.Tk):
         title.grid(row=0, column=0, sticky="w")
         ttk.Label(title, text="Senior Design Test Stand", style="Header.TLabel").pack(anchor="w")
         self.header_detail_var = tk.StringVar(
-            value="Live bushing position from AIN2  •  Grease pressure and temperatures are simulated"
+            value="Live AIN2 bushing position and cycle counting  •  Auxiliary inputs awaiting configuration"
         )
         ttk.Label(title, textvariable=self.header_detail_var, style="Subheader.TLabel").pack(anchor="w", pady=(3, 0))
         self.labjack_status_var = tk.StringVar(value="LabJack T4 • Checking connection")
@@ -1131,13 +1078,11 @@ class TestStandApp(tk.Tk):
         self._metric(self.metrics, 0, 0, "Completed Cycles", "cycles", "0", "Configured cycle stops")
         self._metric(self.metrics, 0, 1, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
         self._metric(self.metrics, 0, 2, "Cycle Frequency", "frequency", "0.0 cpm", "Rolling 60-second rate")
-        self.simulated_metric_frames = [
-            self._metric(self.metrics, 0, 3, "Grease Pressure", "pressure", "35 psi", "Simulated"),
-            self._metric(self.metrics, 1, 0, "Temperature 1", "temp_1", "72.0 °F", "Simulated"),
-            self._metric(self.metrics, 1, 1, "Temperature 2", "temp_2", "72.5 °F", "Simulated"),
-            self._metric(self.metrics, 1, 2, "Temperature 3", "temp_3", "71.5 °F", "Simulated"),
-            self._metric(self.metrics, 1, 3, "Temperature 4", "temp_4", "72.5 °F", "Simulated"),
-        ]
+        self._metric(self.metrics, 0, 3, "Grease Pressure", "pressure", "— psi", "Input not configured")
+        self._metric(self.metrics, 1, 0, "Temperature 1", "temp_1", "— °F", "Input not configured")
+        self._metric(self.metrics, 1, 1, "Temperature 2", "temp_2", "— °F", "Input not configured")
+        self._metric(self.metrics, 1, 2, "Temperature 3", "temp_3", "— °F", "Input not configured")
+        self._metric(self.metrics, 1, 3, "Temperature 4", "temp_4", "— °F", "Input not configured")
 
         controls = ttk.LabelFrame(main, text="Test Controls", padding=12)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 10))
@@ -1155,83 +1100,34 @@ class TestStandApp(tk.Tk):
         self.stop_button.pack(side="left", padx=(6, 0))
         self.reset_button = ttk.Button(count_buttons, text="Reset", command=self.reset_counting)
         self.reset_button.pack(side="left", padx=(6, 0))
-        self.grease_controls_frame = ttk.Frame(controls)
-        self.grease_controls_frame.grid(row=0, column=1, columnspan=6, sticky="ew")
-        ttk.Label(self.grease_controls_frame, text="Grease every").grid(row=0, column=0, sticky="e")
-        self.interval_var = tk.StringVar(value="10")
-        ttk.Spinbox(self.grease_controls_frame, from_=0.1, to=100000, increment=1, textvariable=self.interval_var,
-                    width=9).grid(row=0, column=1, padx=5)
-        self.interval_unit_var = tk.StringVar(value="minutes")
-        ttk.Combobox(
-            self.grease_controls_frame, textvariable=self.interval_unit_var, state="readonly", width=9,
-            values=("seconds", "minutes"),
-        ).grid(row=0, column=2, sticky="w")
-        ttk.Button(self.grease_controls_frame, text="Apply", command=self.apply_interval).grid(row=0, column=3, padx=(6, 18))
-        self.grease_button = ttk.Button(self.grease_controls_frame, text="Grease Now", style="Grease.TButton",
-                                        command=self.manual_grease)
-        self.grease_button.grid(row=0, column=4, padx=(0, 12))
-
-        ttk.Label(self.grease_controls_frame, text="Next lubrication:").grid(row=1, column=0, columnspan=2,
-                                                                               sticky="w", pady=(10, 0))
-        self.next_lube_var = tk.StringVar()
-        ttk.Label(self.grease_controls_frame, textvariable=self.next_lube_var, font=("Segoe UI", 10, "bold")).grid(
-            row=1, column=2, columnspan=2, sticky="w", pady=(10, 0)
-        )
-        ttk.Label(self.grease_controls_frame, text="Simulated outcome:").grid(row=1, column=4, sticky="e", pady=(10, 0))
-        self.outcome_var = tk.StringVar(value=self.grease_outcome)
-        outcome = ttk.Combobox(
-            self.grease_controls_frame,
-            textvariable=self.outcome_var,
-            state="readonly",
-            width=31,
-            values=(
-                "Successful pressure sequence",
-                "Fail: pressure does not rise",
-                "Fail: pressure does not reset",
-            ),
-        )
-        outcome.grid(row=1, column=5, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 0))
         self.calibrate_button = ttk.Button(controls, text="Calibrate AIN2 Position", command=self.open_calibration_window)
         self.calibrate_button.grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(12, 0)
+            row=1, column=0, columnspan=2, sticky="w", pady=(12, 0)
         )
         calibration_text = "Calibration saved" if self.position_calibration else "Calibration required"
         ttk.Label(controls, text=calibration_text, foreground="#475569").grid(
-            row=2, column=2, columnspan=4, sticky="w", pady=(12, 0)
+            row=1, column=2, columnspan=4, sticky="w", pady=(12, 0)
         )
         self.cycle_stops_button = ttk.Button(
             controls, text="Input Cycle Stops", command=self.open_cycle_stops_window
         )
         self.cycle_stops_button.grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(10, 0)
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
         ttk.Label(controls, textvariable=self.cycle_stops_var, foreground="#475569").grid(
-            row=3, column=2, columnspan=4, sticky="w", pady=(10, 0)
+            row=2, column=2, columnspan=4, sticky="w", pady=(10, 0)
         )
 
         self.chart_holder = ttk.Frame(main)
         self.chart_holder.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         self.chart_holder.columnconfigure(0, weight=1)
-        self.chart_holder.columnconfigure(1, weight=1)
         self.chart_holder.rowconfigure(0, weight=1)
         self.bushing_plot = LivePlot(self.chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
-        self.bushing_plot.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.bushing_plot.grid(row=0, column=0, sticky="nsew")
         self.configure_bushing_plot(clear_samples=False)
-        self.pressure_plot = LivePlot(self.chart_holder, "Simulated grease pressure (psi)", 5000, "#d97706")
-        self.pressure_plot.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
-        status_box = ttk.LabelFrame(main, text="Test Activity", padding=12)
+        status_box = ttk.LabelFrame(main, text="Event Log", padding=12)
         status_box.grid(row=2, column=1, sticky="nsew")
-        self.grease_status_var = tk.StringVar(value=self.grease_phase)
-        self.grease_status_section = ttk.Frame(status_box)
-        self.grease_status_section.pack(fill="x", anchor="w")
-        ttk.Label(self.grease_status_section, text="Greasing (simulated)", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(self.grease_status_section, textvariable=self.grease_status_var, wraplength=330,
-                  font=("Segoe UI", 12, "bold"), foreground="#1e3a8a").pack(anchor="w")
-        self.event_log_label = ttk.Label(status_box, text="Event Log", font=("Segoe UI", 10, "bold"), background="#ffffff")
-        self.event_log_label.pack(
-            anchor="w", pady=(12, 4)
-        )
         self.event_log = ScrolledText(status_box, height=14, wrap="word", state="disabled",
                                       font=("Consolas", 9), background="#f8fafc", foreground="#1e293b",
                                       relief="flat")
@@ -1268,13 +1164,12 @@ class TestStandApp(tk.Tk):
             "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "app_version": APP_VERSION,
             "sensor_log_interval_seconds": self.sensor_log_interval_seconds,
-            "grease_interval_seconds": self.grease_interval_seconds,
             "position_calibration": self.position_calibration,
             "cycle_stops": self.cycle_stops,
             "signals": {
                 "ain2_bushing_position": "LabJack T4 live read-only input",
-                "grease_pressure": "simulated",
-                "temperature_1_to_4": "simulated",
+                "grease_pressure": "hardware input not configured",
+                "temperature_1_to_4": "hardware inputs not configured",
                 "physical_outputs": "not implemented",
             },
         }
@@ -1396,103 +1291,6 @@ class TestStandApp(tk.Tk):
             "Cycle counting reset",
             "Cycle and CPM totals cleared.",
         )
-
-    def apply_interval(self) -> None:
-        try:
-            interval = float(self.interval_var.get())
-            if interval <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid interval", "Enter a positive lubrication interval.")
-            return
-        unit_seconds = {"seconds": 1.0, "minutes": 60.0}
-        unit = self.interval_unit_var.get()
-        self.grease_interval_seconds = interval * unit_seconds[unit]
-        self.next_grease_time_seconds = self.simulation_elapsed + self.grease_interval_seconds
-        self._write_run_configuration_snapshot()
-        self.log_event(
-            "Grease interval changed",
-            f"Every {interval:g} {unit} of active test time.",
-        )
-
-    def manual_grease(self) -> None:
-        if self.grease_phase.startswith(("Pressurizing", "Venting")):
-            self.log_event("Manual grease ignored", "A simulated grease sequence is already in progress.")
-            return
-        self.begin_grease(manual=True)
-
-    def begin_grease(self, manual: bool) -> None:
-        self.grease_outcome = self.outcome_var.get()
-        self.grease_started = time.monotonic()
-        self.grease_phase = "Pressurizing (simulated)"
-        self.next_grease_time_seconds = self.simulation_elapsed + self.grease_interval_seconds
-        reason = "Manual" if manual else "Automatic scheduled"
-        self.log_event(
-            f"{reason} grease command",
-            f"Simulated command started. Selected outcome: {self.grease_outcome}.",
-        )
-
-    def _update_position(self, dt: float) -> None:
-        """Keep simulated auxiliary signals advancing only while a session is active."""
-        if self.is_running:
-            self.simulation_elapsed += dt
-
-    def _update_timed_grease(self) -> None:
-        """Start the simulated grease sequence on active-session elapsed time, never cycles."""
-        if (
-            self.is_running
-            and self.grease_phase.startswith("Idle")
-            and self.simulation_elapsed >= self.next_grease_time_seconds
-        ):
-            self.begin_grease(manual=False)
-
-    @staticmethod
-    def _format_duration(seconds: float) -> str:
-        total_seconds = max(0, math.ceil(seconds))
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, seconds_part = divmod(remainder, 60)
-        if hours:
-            return f"{hours}h {minutes:02d}m {seconds_part:02d}s"
-        if minutes:
-            return f"{minutes}m {seconds_part:02d}s"
-        return f"{seconds_part}s"
-
-    def _update_grease_pressure(self) -> None:
-        now = time.monotonic()
-        if self.grease_phase.startswith("Pressurizing"):
-            elapsed = now - self.grease_started
-            target = 3500.0 if self.grease_outcome != "Fail: pressure does not rise" else 900.0
-            self.pressure = 35 + (target - 35) * (1 - math.exp(-elapsed * 1.25)) + random.uniform(-18, 18)
-            if elapsed >= 3.0:
-                if self.pressure < PRESSURE_REACHED_PSI:
-                    self.grease_phase = "Fault: pressure did not reach threshold"
-                    self.log_event("Grease fault", "Simulated pressure was below 2,500 psi; command released.")
-                else:
-                    self.pressure_at_vent = self.pressure
-                    self.vent_started = now
-                    self.grease_phase = "Venting (simulated)"
-                    self.log_event("Pressure reached", "Simulated common-line pressure reached verification threshold; venting started.")
-        elif self.grease_phase.startswith("Venting"):
-            elapsed = now - self.vent_started
-            if self.grease_outcome == "Fail: pressure does not reset":
-                floor = 900.0
-                decay_rate = 0.65
-            else:
-                floor = 35.0
-                decay_rate = 1.45
-            self.pressure = floor + (self.pressure_at_vent - floor) * math.exp(-elapsed * decay_rate)
-            self.pressure += random.uniform(-10, 10)
-            if self.pressure <= PRESSURE_RESET_PSI:
-                self.grease_phase = "Idle (sequence verified)"
-                self.log_event(
-                    "Grease sequence complete",
-                    "Simulated common-line pressure rose and reset. Individual injector delivery is not verified.",
-                )
-            elif elapsed >= 4.5:
-                self.grease_phase = "Fault: pressure did not reset"
-                self.log_event("Grease fault", "Simulated pressure remained above reset threshold after venting.")
-        elif self.grease_phase.startswith(("Idle", "Fault")):
-            self.pressure = max(20.0, 35.0 + random.uniform(-4.0, 4.0))
 
     def _frequency(self) -> float:
         now = time.monotonic()
@@ -1748,44 +1546,26 @@ class TestStandApp(tk.Tk):
     def _values(self) -> dict[str, float | int | str]:
         frequency = self._frequency()
         return {
-            "elapsed": self.simulation_elapsed,
+            "elapsed": time.monotonic() - self.logger.started_monotonic,
             "bushing_position": "" if self.bushing_position is None else f"{self.bushing_position:.4f}",
             "bushing_position_unit": self.bushing_unit if self.bushing_position is not None else "",
             "ain2_voltage": "" if self.ain2_voltage is None else f"{self.ain2_voltage:.5f}",
-            "pressure": self.pressure,
-            "temp_1": self.temperature_1,
-            "temp_2": self.temperature_2,
-            "temp_3": self.temperature_3,
-            "temp_4": self.temperature_4,
+            "pressure": "",
+            "temp_1": "",
+            "temp_2": "",
+            "temp_3": "",
+            "temp_4": "",
             "cycles": self.cycles,
             "frequency": frequency,
-            "grease_status": self.grease_phase,
+            "auxiliary_status": "not configured",
         }
 
     def tick(self) -> None:
         now = time.monotonic()
-        dt = min(now - self.last_tick, 0.5)
-        self.last_tick = now
         self._update_live_bushing_position(now)
-        self._update_position(dt)
-        self._update_timed_grease()
-        self._update_grease_pressure()
-        self.temperature_1 = 72.0 + 1.4 * math.sin(self.simulation_elapsed / 35) + random.uniform(-0.08, 0.08)
-        self.temperature_2 = 73.0 + 1.1 * math.sin(self.simulation_elapsed / 41 + 0.7) + random.uniform(-0.08, 0.08)
-        self.temperature_3 = 71.5 + 1.2 * math.sin(self.simulation_elapsed / 47 + 1.1) + random.uniform(-0.08, 0.08)
-        self.temperature_4 = 72.5 + 0.9 * math.sin(self.simulation_elapsed / 53 + 2.0) + random.uniform(-0.08, 0.08)
         values = self._values()
         self.metric_vars["cycles"].set(str(self.cycles))
         self.metric_vars["frequency"].set(f"{values['frequency']:0.1f} cpm")
-        self.metric_vars["pressure"].set(f"{self.pressure:,.0f} psi")
-        self.metric_vars["temp_1"].set(f"{self.temperature_1:0.1f} °F")
-        self.metric_vars["temp_2"].set(f"{self.temperature_2:0.1f} °F")
-        self.metric_vars["temp_3"].set(f"{self.temperature_3:0.1f} °F")
-        self.metric_vars["temp_4"].set(f"{self.temperature_4:0.1f} °F")
-        self.grease_status_var.set(self.grease_phase)
-        remaining = max(0.0, self.next_grease_time_seconds - self.simulation_elapsed)
-        self.next_lube_var.set(f"{self._format_duration(remaining)} remaining (active test time)")
-        self.pressure_plot.add(self.pressure)
         if now - self.last_sensor_log >= self.sensor_log_interval_seconds:
             self.logger.log_reading(values, live_run_id=self.current_live_run_id)
             self.last_sensor_log = now
@@ -1800,7 +1580,7 @@ class TestStandApp(tk.Tk):
         self.logger.finalize(
             completed_cycles=self.cycles,
             cycle_frequency_cpm=round(self._frequency(), 2),
-            final_grease_status=self.grease_phase,
+            final_auxiliary_status="not_configured",
         )
         self.logger.close()
         self.destroy()
