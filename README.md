@@ -78,7 +78,9 @@ Until that read path confirms a connected T4, **Start Counting**, **Calibrate AI
 
 Use **Calibrate AIN2 Position** in the dashboard to create a two-point calibration for the string potentiometer. Enter the known bushing angle at each of two positions, hold the mechanism stationary, and capture each point. A capture uses 100 fresh samples from the same live AIN2 stream used by the dashboard, over about half a second. It removes brief outliers and rejects a signal that is moving or too noisy. The saved calibration linearly interpolates voltage to angle; a preview warns if its voltage is outside the calibrated span.
 
-The dashboard's **Bushing Position** card and left live graph use this real AIN2 feed, not a generated cylinder-position signal. A persistent read-only helper uses the T4's hardware-timed AIN2 stream at 200 samples/second for cycle detection. Every received sample is processed in order for counting; only the displayed card and graph use a five-sample average. Before calibration, the dashboard shows measured AIN2 voltage; after calibration, it shows interpolated bushing angle.
+The dashboard's **Bushing Position** card and live graph use this real AIN2 feed, not a generated cylinder-position signal. A persistent read-only helper uses the T4's hardware-timed AIN2 stream at 200 samples/second for cycle detection. Every received sample is processed in order for counting; only the displayed card and graph use a five-sample average. Before calibration, the dashboard shows measured AIN2 voltage; after calibration, it shows interpolated bushing angle.
+
+After calibration, the **Bushing Velocity** card and graph use the same raw 200 Hz angle stream. The app fits a straight line through the newest 11 calibrated samples (about 55 ms) and uses its signed slope in degrees/second. A small ±0.25°/s deadband shows stationary motion as zero. Velocity is unavailable outside the calibrated AIN2 span and is included in each `sensor_readings.csv` snapshot as `bushing_velocity_degrees_per_second`.
 
 ## AIN2 cycle stops and real cycle counting
 
@@ -92,7 +94,7 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 
 ## What the prototype demonstrates
 
-- A readable operator dashboard with real AIN2 bushing position, real stop-based cycle detection, frequency, and reserved grease-pressure and temperature channels.
+- A readable operator dashboard with real AIN2 bushing position, signed velocity, real stop-based cycle detection, frequency, and reserved grease-pressure and temperature channels.
 - Directional cycle detection using two saved angular stops and hysteresis—not a timer counter.
 - Separate **Start Counting**, **Stop**, and **Reset** controls for cycle counting only. Start and Stop preserve the accumulated cycle total and its rolling CPM history; Reset clears both and re-arms the detector. None controls a pneumatic cylinder.
 - Live bushing-position and grease-pressure plots. The pressure plot stays empty until its hardware input is implemented and retains a 2,500 psi injector-activation reference line.

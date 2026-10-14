@@ -31,12 +31,15 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 DEFAULT_SENSOR_LOG_SECONDS = 1.0
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 AUTO_ARCHIVE_INTERVAL_SECONDS = 60 * 60
 AUTO_ARCHIVE_CONFIG_FILENAME = "auto_archive.json"
+VELOCITY_SLOPE_WINDOW_SAMPLES = 11
+VELOCITY_ZERO_DEADBAND_DPS = 0.25
+DEFAULT_VELOCITY_GRAPH_LIMIT_DPS = 100.0
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
 MIN_CYCLE_STOP_SEPARATION_DEGREES = 1.0
 CALIBRATION_STREAM_SAMPLE_COUNT = 100
@@ -1120,10 +1123,13 @@ class TestStandApp(tk.Tk):
         self.last_labjack_signature = ""
         self.ain2_voltage: float | None = None
         self.bushing_position: float | None = None
+        self.bushing_velocity: float | None = None
         self.grease_pressure: float | None = None
         self.bushing_unit = "degrees" if self.position_calibration else "volts"
         self._display_voltage_samples: deque[float] = deque(maxlen=5)
+        self._velocity_angles: deque[float] = deque(maxlen=VELOCITY_SLOPE_WINDOW_SAMPLES)
         self.bushing_detail_var = tk.StringVar(value="Waiting for AIN2")
+        self.velocity_detail_var = tk.StringVar(value="Calibrate AIN2 to calculate velocity")
         self.cycle_stops_var = tk.StringVar(value=self.cycle_stops_summary())
         self.event_terminal: EventTerminalDialog | None = None
 
@@ -1268,7 +1274,7 @@ class TestStandApp(tk.Tk):
 
         self.metrics = ttk.Frame(main)
         self.metrics.grid(row=0, column=0, columnspan=2, sticky="ew")
-        for column in range(4):
+        for column in range(5):
             self.metrics.columnconfigure(column, weight=1, uniform="metrics")
         for row in range(2):
             self.metrics.rowconfigure(row, weight=1)
@@ -1276,8 +1282,9 @@ class TestStandApp(tk.Tk):
         self.metric_vars: dict[str, tk.StringVar] = {}
         self._metric(self.metrics, 0, 0, "Completed Cycles", "cycles", "0", "Configured cycle stops")
         self._metric(self.metrics, 0, 1, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
-        self._metric(self.metrics, 0, 2, "Cycle Frequency", "frequency", "0.0 cpm", "Rolling 60-second rate")
-        self._metric(self.metrics, 0, 3, "Grease Pressure", "pressure", "— psi", "Input not configured")
+        self._metric(self.metrics, 0, 2, "Bushing Velocity", "velocity", "— °/s", self.velocity_detail_var)
+        self._metric(self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", "Rolling 60-second rate")
+        self._metric(self.metrics, 0, 4, "Grease Pressure", "pressure", "— psi", "Input not configured")
         self._metric(self.metrics, 1, 0, "Temperature 1", "temp_1", "— °F", "Input not configured")
         self._metric(self.metrics, 1, 1, "Temperature 2", "temp_2", "— °F", "Input not configured")
         self._metric(self.metrics, 1, 2, "Temperature 3", "temp_3", "— °F", "Input not configured")
@@ -1321,17 +1328,27 @@ class TestStandApp(tk.Tk):
         self.chart_holder.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         self.chart_holder.columnconfigure(0, weight=1)
         self.chart_holder.columnconfigure(1, weight=1)
+        self.chart_holder.columnconfigure(2, weight=1)
         self.chart_holder.rowconfigure(0, weight=1)
         self.bushing_plot = LivePlot(self.chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
         self.bushing_plot.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.configure_bushing_plot(clear_samples=False)
+        self.velocity_plot = LivePlot(
+            self.chart_holder,
+            "Live bushing velocity (°/s) — calibration required",
+            DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
+            "#2563eb",
+            minimum=-DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
+        )
+        self.velocity_plot.grid(row=0, column=1, sticky="nsew", padx=5)
+        self.configure_velocity_plot(clear_samples=False)
         self.pressure_plot = LivePlot(
             self.chart_holder,
             "Grease pressure (psi) — input not configured",
             5000.0,
             "#d97706",
         )
-        self.pressure_plot.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        self.pressure_plot.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
         self.pressure_plot.set_reference_lines([
             (INJECTOR_ACTIVATION_PSI, "#7c3aed", "Injector activation"),
         ])
@@ -1713,6 +1730,7 @@ class TestStandApp(tk.Tk):
         self.position_calibration = calibration
         self.bushing_unit = "degrees"
         self.configure_bushing_plot()
+        self.configure_velocity_plot()
         self._write_run_configuration_snapshot()
 
     def clear_position_calibration(self) -> None:
@@ -1720,6 +1738,7 @@ class TestStandApp(tk.Tk):
         self.position_calibration = None
         self.bushing_unit = "volts"
         self.configure_bushing_plot()
+        self.configure_velocity_plot()
         self._write_run_configuration_snapshot()
         self.log_event("AIN2 calibration cleared", "Saved two-point AIN2 calibration removed.")
 
@@ -1799,6 +1818,63 @@ class TestStandApp(tk.Tk):
         else:
             self.bushing_plot.set_reference_lines([])
 
+    def configure_velocity_plot(self, clear_samples: bool = True) -> None:
+        """Reset velocity state when calibration changes and show a signed speed scale."""
+        self._velocity_angles.clear()
+        self.bushing_velocity = None
+        self.metric_vars["velocity"].set("— °/s")
+        if not self.position_calibration:
+            self.velocity_detail_var.set("Calibrate AIN2 to calculate velocity")
+            self.velocity_plot.set_scale(
+                "Live bushing velocity (°/s) — calibration required",
+                -DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
+                DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
+                clear_samples,
+            )
+        else:
+            self.velocity_detail_var.set("Waiting for live AIN2 samples")
+            self.velocity_plot.set_scale(
+                "Live bushing velocity (°/s, calibrated AIN2)",
+                -DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
+                DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
+                clear_samples,
+            )
+        self.velocity_plot.set_reference_lines([(0.0, "#94a3b8", "Stationary")])
+
+    def _update_bushing_velocity(self, angle: float, scan_rate_hz: float) -> None:
+        """Fit a short local line to raw calibrated positions for stable signed velocity."""
+        self._velocity_angles.append(angle)
+        if len(self._velocity_angles) < VELOCITY_SLOPE_WINDOW_SAMPLES:
+            self.bushing_velocity = None
+            self.metric_vars["velocity"].set("— °/s")
+            self.velocity_detail_var.set("Collecting calibrated AIN2 samples")
+            return
+
+        values = tuple(self._velocity_angles)
+        center = (len(values) - 1) / 2
+        denominator = sum((index - center) ** 2 for index in range(len(values)))
+        slope_per_sample = sum((index - center) * value for index, value in enumerate(values)) / denominator
+        sample_rate = max(1.0, scan_rate_hz)
+        velocity = slope_per_sample * sample_rate
+        if abs(velocity) < VELOCITY_ZERO_DEADBAND_DPS:
+            velocity = 0.0
+        self.bushing_velocity = velocity
+        self.velocity_detail_var.set(f"{len(values)}-sample fit • {sample_rate:.0f} Hz")
+
+    def _render_bushing_velocity(self) -> None:
+        """Render the latest raw-stream velocity at the same cadence as the position UI."""
+        if self.bushing_velocity is None:
+            return
+        limit = max(abs(self.velocity_plot.minimum), abs(self.velocity_plot.maximum))
+        if abs(self.bushing_velocity) > limit * 0.95:
+            new_limit = max(DEFAULT_VELOCITY_GRAPH_LIMIT_DPS, (int(abs(self.bushing_velocity) / 25) + 2) * 25.0)
+            self.velocity_plot.set_scale(
+                "Live bushing velocity (°/s, calibrated AIN2)", -new_limit, new_limit, clear_samples=False
+            )
+            self.velocity_plot.set_reference_lines([(0.0, "#94a3b8", "Stationary")])
+        self.metric_vars["velocity"].set(f"{self.bushing_velocity:+.2f} °/s")
+        self.velocity_plot.add(self.bushing_velocity)
+
     def _update_cycle_count_from_bushing(self, angle: float) -> None:
         """Use direction-independent stop hysteresis to count real motion once per stroke."""
         if not self.is_running or not self.cycle_stops:
@@ -1835,12 +1911,25 @@ class TestStandApp(tk.Tk):
         for result in results:
             if result.get("status") == "success":
                 self._set_labjack_connection_state("connected", "AIN2 stream is active.")
+                try:
+                    scan_rate_hz = float(result.get("scan_rate_hz", 200.0))
+                except (TypeError, ValueError):
+                    scan_rate_hz = 200.0
+                try:
+                    skipped_samples = int(result.get("skipped_samples", 0))
+                except (TypeError, ValueError):
+                    skipped_samples = 0
+                if skipped_samples:
+                    self._velocity_angles.clear()
+                    self.bushing_velocity = None
+                    self.metric_vars["velocity"].set("— °/s")
+                    self.velocity_detail_var.set("AIN2 stream gap — velocity rearming")
                 for raw_voltage in result.get("samples", []):
                     try:
                         voltage = float(raw_voltage)
                     except (TypeError, ValueError):
                         continue
-                    self._process_counting_voltage(voltage)
+                    self._process_counting_voltage(voltage, scan_rate_hz)
                     latest_voltage = voltage
             elif result.get("status") == "disconnected":
                 self._set_labjack_connection_state(
@@ -1851,14 +1940,21 @@ class TestStandApp(tk.Tk):
 
         if latest_voltage is not None:
             self._render_live_bushing_position(statistics.fmean(self._display_voltage_samples))
+            self._render_bushing_velocity()
 
-    def _process_counting_voltage(self, voltage: float) -> None:
+    def _process_counting_voltage(self, voltage: float, scan_rate_hz: float) -> None:
         """Feed each hardware-timed sample to the detector; never reject it for motion."""
         self._display_voltage_samples.append(voltage)
         if self.position_calibration:
             angle, outside = self.angle_from_voltage(voltage, self.position_calibration)
             if not outside:
                 self._update_cycle_count_from_bushing(angle)
+                self._update_bushing_velocity(angle, scan_rate_hz)
+            else:
+                self._velocity_angles.clear()
+                self.bushing_velocity = None
+                self.metric_vars["velocity"].set("— °/s")
+                self.velocity_detail_var.set("Outside calibrated AIN2 span")
 
     def _render_live_bushing_position(self, voltage: float) -> None:
         """Render a short display-only average without affecting cycle detection."""
@@ -1947,6 +2043,7 @@ class TestStandApp(tk.Tk):
             "elapsed": time.monotonic() - self.logger.started_monotonic,
             "bushing_position": "" if self.bushing_position is None else f"{self.bushing_position:.4f}",
             "bushing_position_unit": self.bushing_unit if self.bushing_position is not None else "",
+            "bushing_velocity": "" if self.bushing_velocity is None else f"{self.bushing_velocity:.4f}",
             "ain2_voltage": "" if self.ain2_voltage is None else f"{self.ain2_voltage:.5f}",
             "pressure": "" if self.grease_pressure is None else self.grease_pressure,
             "temp_1": "",

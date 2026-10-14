@@ -21,6 +21,9 @@ For live bushing position and cycle counting:
    "Connection: SUCCESS".
 4. Start TestStand.exe.
 
+The Bushing Velocity card and graph become active after the two-point AIN2
+position calibration is saved.
+
 Python is already included in this package. Do not install Python or run pip.
 
 The newest application ZIP is always on the project's Releases page:
