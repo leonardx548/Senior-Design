@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.7"
+APP_VERSION = "0.3.8"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -67,6 +67,7 @@ EXPORT_FILE_OPTIONS = (
     ("configuration", "Run configuration", "run_configuration.json"),
 )
 DEFAULT_AUTO_ARCHIVE_INCLUDE = ("cycles", "grease")
+AUTO_ARCHIVE_CONFIG_SCHEMA_VERSION = 2
 
 
 def auto_archive_interval_label(interval_seconds: int) -> str:
@@ -1673,6 +1674,7 @@ class TestStandApp(tk.Tk):
     @staticmethod
     def _default_auto_archive_config() -> dict[str, object]:
         return {
+            "schema_version": AUTO_ARCHIVE_CONFIG_SCHEMA_VERSION,
             "enabled": False,
             "directory": "",
             "include": list(DEFAULT_AUTO_ARCHIVE_INCLUDE),
@@ -1690,6 +1692,15 @@ class TestStandApp(tk.Tk):
             configured_keys = config["include"]
         allowed_keys = {key for key, _label, _file in EXPORT_FILE_OPTIONS}
         include = [str(key) for key in configured_keys if str(key) in allowed_keys]
+        try:
+            schema_version = int(saved.get("schema_version", 1))
+        except (TypeError, ValueError):
+            schema_version = 1
+        if schema_version < AUTO_ARCHIVE_CONFIG_SCHEMA_VERSION:
+            # Bring existing installations forward to the two useful default
+            # data files once, while retaining every selection they made.
+            configured_set = set(include) | set(DEFAULT_AUTO_ARCHIVE_INCLUDE)
+            include = [key for key, _label, _file in EXPORT_FILE_OPTIONS if key in configured_set]
         allowed_intervals = {seconds for _label, seconds in AUTO_ARCHIVE_INTERVAL_OPTIONS}
         try:
             interval_seconds = int(saved.get("interval_seconds", config["interval_seconds"]))
@@ -1698,6 +1709,7 @@ class TestStandApp(tk.Tk):
         if interval_seconds not in allowed_intervals:
             interval_seconds = AUTO_ARCHIVE_INTERVAL_SECONDS
         return {
+            "schema_version": AUTO_ARCHIVE_CONFIG_SCHEMA_VERSION,
             "enabled": bool(saved.get("enabled", False)),
             "directory": str(saved.get("directory", "")).strip(),
             "include": include or list(config["include"]),
@@ -1708,6 +1720,7 @@ class TestStandApp(tk.Tk):
         self, *, enabled: bool, directory: str, include: list[str], interval_seconds: int
     ) -> None:
         self.auto_archive_config = {
+            "schema_version": AUTO_ARCHIVE_CONFIG_SCHEMA_VERSION,
             "enabled": bool(enabled),
             "directory": directory,
             "include": include,
