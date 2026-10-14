@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.13"
+APP_VERSION = "0.3.14"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -425,6 +425,22 @@ class LivePlot(tk.Canvas):
             "width": max(self.winfo_width(), 600),
             "height": max(self.winfo_height(), 240),
         }
+
+    def load_snapshot_state(self, state: dict[str, object]) -> None:
+        """Mirror another plot's current view in an expanded read-only canvas."""
+        self.title = str(state["title"])
+        self.minimum = float(state["minimum"])
+        self.maximum = float(state["maximum"])
+        self.color = str(state["color"])
+        self.samples = deque((float(sample[0]), float(sample[1])) for sample in state["samples"])
+        self.reference_lines = [tuple(item) for item in state["reference_lines"]]  # type: ignore[list-item]
+        self.history_seconds = float(state["history_seconds"])
+        self._window_end_override = float(state["window_end_monotonic"])
+        self._time_labels = (
+            str(state.get("left_time_label", f"{self.history_seconds:g}s ago")),
+            str(state.get("right_time_label", "now")),
+        )
+        self.redraw()
 
     @staticmethod
     def write_svg(path: Path, state: dict[str, object]) -> None:
@@ -1350,6 +1366,85 @@ class EventTerminalDialog(tk.Toplevel):
         self.output.see("end")
 
 
+class GraphReviewDialog(tk.Toplevel):
+    """Expanded, synchronized view of the position and velocity charts."""
+
+    def __init__(self, app: "TestStandApp") -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("Position and Velocity Review")
+        self.geometry("1120x780")
+        self.minsize(760, 560)
+        self.configure(background="#f1f5f9")
+        self._refresh_after_id: str | None = None
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+        toolbar = ttk.Frame(outer)
+        toolbar.pack(fill="x", pady=(0, 8))
+        ttk.Label(toolbar, text="Position and velocity review", font=("Segoe UI", 14, "bold")).pack(side="left")
+        ttk.Label(toolbar, textvariable=app.graph_window_var, foreground="#64748b").pack(side="left", padx=(12, 0))
+
+        self.pan_left_button = ttk.Button(
+            toolbar, text="◀", width=3, style="Icon.TButton", command=lambda: self._pan(SNAPSHOT_PAN_STEP_SECONDS)
+        )
+        self.pan_left_button.pack(side="right", padx=(6, 0))
+        self.pan_right_button = ttk.Button(
+            toolbar, text="▶", width=3, style="Icon.TButton", command=lambda: self._pan(-SNAPSHOT_PAN_STEP_SECONDS)
+        )
+        self.pan_right_button.pack(side="right")
+        self.pause_button = ttk.Button(toolbar, command=self._toggle_pause)
+        self.pause_button.pack(side="right", padx=(0, 6))
+        self.save_button = ttk.Button(toolbar, text="Save Snapshot…", command=self.app.save_graph_snapshot)
+        self.save_button.pack(side="right", padx=(0, 6))
+
+        charts = ttk.Frame(outer)
+        charts.pack(fill="both", expand=True)
+        charts.columnconfigure(0, weight=1)
+        charts.rowconfigure(0, weight=1)
+        charts.rowconfigure(1, weight=1)
+        self.position_plot = LivePlot(charts, "Bushing position", 1.0, "#0891b2")
+        self.position_plot.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+        self.velocity_plot = LivePlot(charts, "Bushing velocity", 1.0, "#2563eb", minimum=-1.0)
+        self.velocity_plot.grid(row=1, column=0, sticky="nsew")
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._refresh()
+
+    def _pan(self, seconds: float) -> None:
+        self.app.pan_paused_graphs(seconds)
+
+    def _toggle_pause(self) -> None:
+        self.app.toggle_graph_pause()
+
+    def _refresh(self) -> None:
+        """Mirror the dashboard plots while this expanded window is open."""
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self.position_plot.load_snapshot_state(self.app.bushing_plot.snapshot_state())
+        self.velocity_plot.load_snapshot_state(self.app.velocity_plot.snapshot_state())
+        self.pause_button.configure(text="Resume" if self.app.graphs_paused else "Pause")
+        self.save_button.configure(state="normal" if self.app.graphs_paused else "disabled")
+        maximum = self.app._maximum_graph_pan_seconds()
+        self.pan_left_button.configure(
+            state="normal" if self.app.graphs_paused and self.app.graph_pan_offset_seconds < maximum - 0.05 else "disabled"
+        )
+        self.pan_right_button.configure(
+            state="normal" if self.app.graphs_paused and self.app.graph_pan_offset_seconds > 0.05 else "disabled"
+        )
+        self._refresh_after_id = self.after(100, self._refresh)
+
+    def _close(self) -> None:
+        if self._refresh_after_id is not None:
+            self.after_cancel(self._refresh_after_id)
+            self._refresh_after_id = None
+        self.app.graph_review_window = None
+        self.destroy()
+
+
 class TestStandApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1407,6 +1502,7 @@ class TestStandApp(tk.Tk):
         self.velocity_detail_var = tk.StringVar(value="Calibrate AIN2 to calculate velocity")
         self.cycle_stops_var = tk.StringVar(value=self.cycle_stops_summary())
         self.event_terminal: EventTerminalDialog | None = None
+        self.graph_review_window: GraphReviewDialog | None = None
 
         self._build_style()
         self._build_menu()
@@ -1618,6 +1714,13 @@ class TestStandApp(tk.Tk):
             chart_toolbar, text="Save Snapshot…", command=self.save_graph_snapshot, state="disabled"
         )
         self.save_snapshot_button.pack(side="right", padx=(0, 6))
+        ttk.Button(
+            chart_toolbar,
+            text="⛶",
+            width=3,
+            style="Icon.TButton",
+            command=self.open_graph_review_window,
+        ).pack(side="right", padx=(0, 6))
         self.bushing_plot = LivePlot(self.chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
         self.bushing_plot.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
         self.configure_bushing_plot(clear_samples=False)
@@ -1695,6 +1798,15 @@ class TestStandApp(tk.Tk):
             self.event_terminal.focus_set()
             return
         self.event_terminal = EventTerminalDialog(self)
+
+    def open_graph_review_window(self) -> None:
+        """Open one synchronized expanded position/velocity chart view."""
+        if self.graph_review_window is not None and self.graph_review_window.winfo_exists():
+            self.graph_review_window.deiconify()
+            self.graph_review_window.lift()
+            self.graph_review_window.focus_set()
+            return
+        self.graph_review_window = GraphReviewDialog(self)
 
     def _run_configuration_values(self) -> dict[str, object]:
         return {

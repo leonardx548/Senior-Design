@@ -61,7 +61,7 @@ The application does not create a periodic dashboard-snapshot log or retain raw 
 
 ## Position and velocity graph snapshots
 
-The **Pause** button above the position and velocity charts freezes only those two chart displays, so an operator can inspect an event without interrupting the LabJack stream, cycle counting, velocity calculation, or normal run logging. It freezes the latest 60 seconds of calibrated AIN2 data at the hardware stream rate (normally 200 Hz). The charts show a 15-second window; use the left/right arrows to inspect older or newer portions of that frozen buffer. Each graph’s time labels update relative to the pause point. **Resume** returns the charts to the live view and discards that frozen copy.
+The **Pause** button above the position and velocity charts freezes only those two chart displays, so an operator can inspect an event without interrupting the LabJack stream, cycle counting, velocity calculation, or normal run logging. It freezes the latest 60 seconds of calibrated AIN2 data at the hardware stream rate (normally 200 Hz). The charts show a 15-second window; use the left/right arrows to inspect older or newer portions of that frozen buffer. Each graph’s time labels update relative to the pause point. Use the **⛶** button for a synchronized full-size review window with the same controls. **Resume** returns the charts to the live view and discards that frozen copy.
 
 While paused, **Save Snapshot…** writes the currently displayed 15-second window to a timestamped folder. If an automatic archive/output folder is configured, it is created under `snapshots` in that folder; otherwise it is created under `%LOCALAPPDATA%\SeniorDesignTestStand\snapshots`. Each folder contains:
 
