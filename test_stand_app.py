@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.9"
+APP_VERSION = "0.3.10"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -2130,8 +2130,11 @@ class TestStandApp(tk.Tk):
         """Fit a short local line to raw calibrated positions for stable signed velocity."""
         self._velocity_angles.append(angle)
         if len(self._velocity_angles) < VELOCITY_SLOPE_WINDOW_SAMPLES:
-            self.bushing_velocity = None
-            self.metric_vars["velocity"].set("— °/s")
+            # A stream is present but its local fit is still warming up.  Plot
+            # zero rather than a gap so a rearming estimator does not make the
+            # velocity trace look like a missing connection.
+            self.bushing_velocity = 0.0
+            self.metric_vars["velocity"].set("+0.00 °/s")
             self.velocity_detail_var.set("Collecting calibrated AIN2 samples")
             return
 
@@ -2270,8 +2273,8 @@ class TestStandApp(tk.Tk):
                     skipped_samples = 0
                 if skipped_samples:
                     self._velocity_angles.clear()
-                    self.bushing_velocity = None
-                    self.metric_vars["velocity"].set("— °/s")
+                    self.bushing_velocity = 0.0
+                    self.metric_vars["velocity"].set("+0.00 °/s")
                     self.velocity_detail_var.set("AIN2 stream gap — velocity rearming")
                     if self._cycle_capture is not None:
                         self._cycle_capture.stream_gap_detected = True
@@ -2315,8 +2318,8 @@ class TestStandApp(tk.Tk):
                 self._update_cycle_count_from_bushing(angle, sample_at, sample_monotonic)
             else:
                 self._velocity_angles.clear()
-                self.bushing_velocity = None
-                self.metric_vars["velocity"].set("— °/s")
+                self.bushing_velocity = 0.0
+                self.metric_vars["velocity"].set("+0.00 °/s")
                 self.velocity_detail_var.set("Outside calibrated AIN2 span")
                 self._discard_cycle_capture("AIN2 left the calibrated span before reaching the count stop.")
 
@@ -2517,14 +2520,18 @@ class TestStandApp(tk.Tk):
             event, event_detail = "LabJack disconnected", detail
             self.bushing_position = None
             self.ain2_voltage = None
+            self.bushing_velocity = None
             self.metric_vars["position"].set("—")
+            self.metric_vars["velocity"].set("— °/s")
             self.bushing_detail_var.set("AIN2 unavailable")
         else:
             text, color = "LabJack T4 • Connection error", "#fca5a5"
             event, event_detail = "LabJack connection error", detail
             self.bushing_position = None
             self.ain2_voltage = None
+            self.bushing_velocity = None
             self.metric_vars["position"].set("—")
+            self.metric_vars["velocity"].set("— °/s")
             self.bushing_detail_var.set("AIN2 unavailable")
 
         self._set_labjack_dependent_controls(state == "connected")
