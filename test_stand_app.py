@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -408,13 +408,12 @@ class LivePlot(tk.Canvas):
             f'<text x="{width - margin_right}" y="{height - 8}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">now</text>',
         ))
         for reference in reference_lines:
-            value, reference_color, label = float(reference[0]), str(reference[1]), str(reference[2])
+            value, reference_color = float(reference[0]), str(reference[1])
             if minimum <= value <= maximum:
                 y = margin_top + chart_height * (1 - (value - minimum) / (maximum - minimum))
-                lines.extend((
-                    f'<line x1="{margin_left}" y1="{y:.2f}" x2="{width - margin_right}" y2="{y:.2f}" stroke="{reference_color}" stroke-width="2" stroke-dasharray="5 3"/>',
-                    f'<text x="{width - margin_right - 3}" y="{y - 3:.2f}" text-anchor="end" fill="{reference_color}" font-family="Segoe UI, Arial" font-size="9" font-weight="700">{xml_escape(label)}</text>',
-                ))
+                lines.append(
+                    f'<line x1="{margin_left}" y1="{y:.2f}" x2="{width - margin_right}" y2="{y:.2f}" stroke="{reference_color}" stroke-width="2" stroke-dasharray="5 3"/>'
+                )
         if len(samples) >= 2:
             points = []
             for sample_time, value in samples:
@@ -446,13 +445,11 @@ class LivePlot(tk.Canvas):
                          font=("Segoe UI", 8))
         self.create_text(width - margin_right, height - 9, text="now", anchor="e", fill="#64748b",
                          font=("Segoe UI", 8))
-        for value, color, label in self.reference_lines:
+        for value, color, _label in self.reference_lines:
             if not self.minimum <= value <= self.maximum:
                 continue
             y = margin_top + chart_height * (1 - (value - self.minimum) / (self.maximum - self.minimum))
             self.create_line(margin_left, y, width - margin_right, y, fill=color, width=2, dash=(5, 3))
-            self.create_text(width - margin_right - 3, y - 3, text=label, anchor="se", fill=color,
-                             font=("Segoe UI", 8, "bold"))
         if len(self.samples) < 2:
             return
         points: list[float] = []
@@ -1476,12 +1473,12 @@ class TestStandApp(tk.Tk):
             self.metrics.rowconfigure(row, weight=1)
 
         self.metric_vars: dict[str, tk.StringVar] = {}
-        self._metric(self.metrics, 0, 0, "Completed Cycles", "cycles", "0", "Configured cycle stops")
+        self._metric(self.metrics, 0, 0, "Completed Cycles", "cycles", "0", None)
         self._metric(self.metrics, 0, 1, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
-        self._metric(self.metrics, 0, 2, "Bushing Velocity", "velocity", "— °/s", self.velocity_detail_var)
-        self._metric(self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", "Rolling 60-second rate")
+        self._metric(self.metrics, 0, 2, "Bushing Velocity", "velocity", "— °/s", None)
+        self._metric(self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", None)
         self._metric(self.metrics, 0, 4, "Grease Pressure", "pressure", "— psi", "Input not configured")
-        self._metric(self.metrics, 1, 0, "Test Time", "test_time", "00:00:00", "Active counting time")
+        self._metric(self.metrics, 1, 0, "Test Time", "test_time", "00:00:00", None)
         self._metric(self.metrics, 1, 1, "Temperature 1", "temp_1", "— °F", "Input not configured")
         self._metric(self.metrics, 1, 2, "Temperature 2", "temp_2", "— °F", "Input not configured")
 
@@ -1575,7 +1572,7 @@ class TestStandApp(tk.Tk):
         self.event_log.pack(fill="both", expand=True)
 
     def _metric(
-        self, parent: ttk.Frame, row: int, column: int, label: str, key: str, initial: str, detail: str | tk.StringVar
+        self, parent: ttk.Frame, row: int, column: int, label: str, key: str, initial: str, detail: str | tk.StringVar | None
     ) -> ttk.Frame:
         frame = ttk.Frame(parent, style="Metric.TFrame", padding=(12, 10))
         frame.grid(
@@ -1587,7 +1584,7 @@ class TestStandApp(tk.Tk):
         ttk.Label(frame, textvariable=variable, style="MetricValue.TLabel").pack(anchor="w", pady=(5, 2))
         if isinstance(detail, tk.StringVar):
             ttk.Label(frame, textvariable=detail, style="MetricDetail.TLabel", wraplength=155).pack(anchor="w")
-        else:
+        elif detail:
             ttk.Label(frame, text=detail, style="MetricDetail.TLabel", wraplength=155).pack(anchor="w")
         return frame
 
