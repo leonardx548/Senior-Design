@@ -29,13 +29,14 @@ from pathlib import Path
 from queue import Empty, Queue
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
+from typing import Callable
 
 from app_storage import AppPaths, CsvLogger
 from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.17"
+APP_VERSION = "0.3.18"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -1466,6 +1467,67 @@ class GraphReviewDialog(tk.Toplevel):
         self.destroy()
 
 
+class TemperatureHistoryDialog(tk.Toplevel):
+    """One temperature channel plotted across the active test duration."""
+
+    def __init__(self, app: "TestStandApp", sensor_number: int) -> None:
+        super().__init__(app)
+        self.app = app
+        self.sensor_number = sensor_number
+        self.title(f"Temperature {sensor_number} History")
+        self.geometry("980x580")
+        self.minsize(700, 420)
+        self.configure(background="#f1f5f9")
+        self._refresh_after_id: str | None = None
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+        header = ttk.Frame(outer)
+        header.pack(fill="x", pady=(0, 8))
+        ttk.Label(header, text=f"Temperature {sensor_number} history", font=("Segoe UI", 14, "bold")).pack(side="left")
+        self.status_var = tk.StringVar()
+        ttk.Label(header, textvariable=self.status_var, foreground="#64748b").pack(side="left", padx=12)
+        self.plot = LivePlot(outer, f"Temperature {sensor_number} (°F)", 100.0, "#dc2626", minimum=0.0)
+        self.plot.pack(fill="both", expand=True)
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        samples = tuple(self.app.temperature_history[self.sensor_number])
+        duration = max(60.0, self.app.test_elapsed_seconds)
+        if samples:
+            values = tuple(value for _elapsed, value in samples)
+            padding = max(1.0, (max(values) - min(values)) * 0.1)
+            self.plot.set_scale(
+                f"Temperature {self.sensor_number} (°F)", min(values) - padding, max(values) + padding, clear_samples=False
+            )
+            self.status_var.set(f"{len(samples):,} readings  •  Test elapsed {self.app._format_test_time(self.app.test_elapsed_seconds)}")
+        else:
+            self.plot.set_scale(f"Temperature {self.sensor_number} (°F)", 0.0, 100.0, clear_samples=False)
+            self.status_var.set("Input not configured — this graph will populate when the probe is connected.")
+        self.plot.history_seconds = duration
+        self.plot.show_window(
+            samples,
+            window_end_monotonic=duration,
+            left_time_label="Test start",
+            right_time_label=self.app._format_test_time(self.app.test_elapsed_seconds),
+        )
+        self._refresh_after_id = self.after(1000, self._refresh)
+
+    def _close(self) -> None:
+        if self._refresh_after_id is not None:
+            self.after_cancel(self._refresh_after_id)
+            self._refresh_after_id = None
+        self.app.temperature_history_windows[self.sensor_number] = None
+        self.destroy()
+
+
 class TestStandApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1507,6 +1569,8 @@ class TestStandApp(tk.Tk):
         self.bushing_position: float | None = None
         self.bushing_velocity: float | None = None
         self.grease_pressure: float | None = None
+        self.temperature_history: dict[int, list[tuple[float, float]]] = {1: [], 2: []}
+        self.temperature_history_windows: dict[int, TemperatureHistoryDialog | None] = {1: None, 2: None}
         self.bushing_unit = "degrees" if self.position_calibration else "volts"
         self._display_voltage_samples: deque[float] = deque(maxlen=5)
         self._velocity_angles: deque[float] = deque(maxlen=VELOCITY_SLOPE_WINDOW_SAMPLES)
@@ -1679,8 +1743,14 @@ class TestStandApp(tk.Tk):
         self._metric(self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", None)
         self._metric(self.metrics, 0, 4, "Grease Pressure", "pressure", "— psi", "Input not configured")
         self._metric(self.metrics, 1, 0, "Test Time", "test_time", "00:00:00", None)
-        self._metric(self.metrics, 1, 1, "Temperature 1", "temp_1", "— °F", "Input not configured")
-        self._metric(self.metrics, 1, 2, "Temperature 2", "temp_2", "— °F", "Input not configured")
+        self._metric(
+            self.metrics, 1, 1, "Temperature 1", "temp_1", "— °F", "Input not configured",
+            expand_command=lambda: self.open_temperature_history_window(1),
+        )
+        self._metric(
+            self.metrics, 1, 2, "Temperature 2", "temp_2", "— °F", "Input not configured",
+            expand_command=lambda: self.open_temperature_history_window(2),
+        )
 
         controls = ttk.LabelFrame(main, text="Test Controls", padding=12)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 10))
@@ -1789,13 +1859,26 @@ class TestStandApp(tk.Tk):
         self.event_log.pack(fill="both", expand=True)
 
     def _metric(
-        self, parent: ttk.Frame, row: int, column: int, label: str, key: str, initial: str, detail: str | tk.StringVar | None
+        self,
+        parent: ttk.Frame,
+        row: int,
+        column: int,
+        label: str,
+        key: str,
+        initial: str,
+        detail: str | tk.StringVar | None,
+        *,
+        expand_command: Callable[[], None] | None = None,
     ) -> ttk.Frame:
         frame = ttk.Frame(parent, style="Metric.TFrame", padding=(12, 10))
         frame.grid(
             row=row, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0), pady=(0 if row == 0 else 5, 0)
         )
-        ttk.Label(frame, text=label, style="MetricName.TLabel").pack(anchor="w")
+        heading = ttk.Frame(frame, style="Metric.TFrame")
+        heading.pack(fill="x")
+        ttk.Label(heading, text=label, style="MetricName.TLabel").pack(side="left")
+        if expand_command is not None:
+            ttk.Button(heading, text="⛶", width=3, style="Icon.TButton", command=expand_command).pack(side="right")
         variable = tk.StringVar(value=initial)
         self.metric_vars[key] = variable
         ttk.Label(frame, textvariable=variable, style="MetricValue.TLabel").pack(anchor="w", pady=(5, 2))
@@ -1833,6 +1916,34 @@ class TestStandApp(tk.Tk):
             self.graph_review_window.focus_set()
             return
         self.graph_review_window = GraphReviewDialog(self)
+
+    def open_temperature_history_window(self, sensor_number: int) -> None:
+        """Open the full-test trend for one temperature input."""
+        existing = self.temperature_history_windows[sensor_number]
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_set()
+            return
+        self.temperature_history_windows[sensor_number] = TemperatureHistoryDialog(self, sensor_number)
+
+    def record_temperature(self, sensor_number: int, temperature_fahrenheit: float) -> None:
+        """Accept a future physical temperature reading and extend its test-history plot."""
+        if sensor_number not in self.temperature_history:
+            raise ValueError("Temperature sensor number must be 1 or 2.")
+        try:
+            value = float(temperature_fahrenheit)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Temperature input must be numeric.") from error
+        if not math.isfinite(value):
+            raise ValueError("Temperature input must be finite.")
+        elapsed = max(0.0, self.test_elapsed_seconds)
+        history = self.temperature_history[sensor_number]
+        if history and elapsed <= history[-1][0]:
+            history[-1] = (elapsed, value)
+        else:
+            history.append((elapsed, value))
+        self.metric_vars[f"temp_{sensor_number}"].set(f"{value:.1f} °F")
 
     def _run_configuration_values(self) -> dict[str, object]:
         return {
@@ -2134,8 +2245,6 @@ class TestStandApp(tk.Tk):
         if self.is_running:
             return
         self.is_running = True
-        self.test_elapsed_seconds = 0.0
-        self.metric_vars["test_time"].set("00:00:00")
         self.cycle_state = "waiting_for_retracted"
         self._cycle_capture = None
         self._begin_live_run()
@@ -2181,6 +2290,8 @@ class TestStandApp(tk.Tk):
         self.cycles = 0
         self.cycle_times.clear()
         self.test_elapsed_seconds = 0.0
+        for history in self.temperature_history.values():
+            history.clear()
         self.cycle_state = "waiting_for_retracted"
         self.metric_vars["cycles"].set("0")
         self.metric_vars["frequency"].set("0.0 cpm")

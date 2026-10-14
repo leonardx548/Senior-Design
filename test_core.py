@@ -96,6 +96,25 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertIn((501.0, 99.0), reduced)
         self.assertEqual(tuple(point[0] for point in reduced), tuple(sorted(point[0] for point in reduced)))
 
+    def test_temperature_history_uses_test_elapsed_time(self) -> None:
+        class ValueCapture:
+            value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        app = TestStandApp.__new__(TestStandApp)
+        app.temperature_history = {1: [], 2: []}
+        app.metric_vars = {"temp_1": ValueCapture(), "temp_2": ValueCapture()}
+        app.test_elapsed_seconds = 12.5
+        app.record_temperature(1, 72.25)
+        app.test_elapsed_seconds = 13.5
+        app.record_temperature(1, 72.5)
+        self.assertEqual(app.temperature_history[1], [(12.5, 72.25), (13.5, 72.5)])
+        self.assertEqual(app.metric_vars["temp_1"].value, "72.5 °F")
+        with self.assertRaises(ValueError):
+            app.record_temperature(3, 70.0)
+
     def test_automatic_archive_retains_a_shared_session_folder(self) -> None:
         """Exporting one run must never delete earlier runs in its CSV folder."""
         paths = AppPaths.create(self.temporary_directory / "app_data")
