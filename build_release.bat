@@ -25,11 +25,11 @@ if errorlevel 1 goto :failed
 copy /y "README.md" "dist\TestStand\README.md" >nul
 copy /y "RELEASE_README.txt" "dist\TestStand\START_HERE.txt" >nul
 mkdir release
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\TestStand\*' -DestinationPath 'release\SeniorDesignTestStand-v0.3.10-windows.zip' -Force"
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\TestStand\*' -DestinationPath 'release\SeniorDesignTestStand-v0.3.11-windows.zip' -Force"
 
 echo.
 echo Release package created:
-echo   release\SeniorDesignTestStand-v0.3.10-windows.zip
+echo   release\SeniorDesignTestStand-v0.3.11-windows.zip
 pause
 exit /b 0
 
