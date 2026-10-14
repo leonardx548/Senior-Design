@@ -1,6 +1,6 @@
 # Senior Design Test Stand
 
-This Windows desktop application uses the physical LabJack T4 read-only AIN2 signal for bushing position and cycle counting. The dashboard also reserves a grease-pressure channel and four temperature channels for future hardware inputs; it does not generate placeholder readings for them. The pressure chart includes a purple injector-activation reference line at 2,500 psi, ready for real pressure input.
+This Windows desktop application uses the physical LabJack T4 read-only AIN2 signal for bushing position and cycle counting. The dashboard also reserves a grease-pressure channel and two temperature channels for future hardware inputs; it does not generate placeholder readings for them. The pressure chart includes a purple injector-activation reference line at 2,500 psi, ready for real pressure input.
 
 ## Quick start for teammates
 
@@ -108,10 +108,11 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 - A readable operator dashboard with real AIN2 bushing position, signed velocity, real stop-based cycle detection, frequency, and reserved grease-pressure and temperature channels.
 - Directional cycle detection using two saved angular stops and hysteresis—not a timer counter.
 - Separate **Start Counting**, **Stop**, and **Reset** controls for cycle counting only. Start and Stop preserve the accumulated cycle total and its rolling CPM history; Reset clears both and re-arms the detector. None controls a pneumatic cylinder.
+- A **Test Time** stopwatch that advances only while counting is active. It starts with a new test, pauses on Stop or disconnect, resets with Reset, and continues across automatic archive boundaries.
 - Live bushing-position and grease-pressure plots. The pressure plot stays empty until its hardware input is implemented and retains a 2,500 psi injector-activation reference line.
 - A compact Recent Events preview plus an **Expand…** button that opens a full-size, live-updating event terminal.
 - Per-run CSV output in `%LOCALAPPDATA%\SeniorDesignTestStand\logs\session_YYYYMMDD_HHMMSS\`:
-  - `cycle_summary.csv` records one row per completed reset-to-count stroke. It includes timing, configured stops, travel direction, peak and median bushing velocity, current CPM, four reserved temperature fields, any grease-event IDs that occurred during the stroke, and a bushing-data-quality indicator.
+  - `cycle_summary.csv` records one row per completed reset-to-count stroke. It includes timing, configured stops, travel direction, peak and median bushing velocity, current CPM, two reserved temperature fields, any grease-event IDs that occurred during the stroke, and a bushing-data-quality indicator.
   - `grease_events.csv` records each actual injector firing separately. It captures the injection timestamp and pulse duration, pressure baseline, peak pressure and time to the 2,500 psi threshold during the first 10 seconds, and medians from the three completed cycles immediately before and after the injection. It also stores the resulting velocity and stroke-duration percentage changes for straightforward Excel or AI analysis.
   - `events.csv` records cycle detections, connection changes, and program events, with the active live-run ID when applicable.
   - `live_runs.json` defines the Start-to-Stop export boundaries and preserves each run's starting configuration.
@@ -119,7 +120,7 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 
 ## Important limits
 
-- The AIN2 bushing-position reading and its derived cycle count are real, read-only T4 measurements. Grease pressure, solenoid commands, and all four temperature channels are not yet connected or implemented. Their dashboard cards stay visible and report "Input not configured" until that hardware work is completed.
+- The AIN2 bushing-position reading and its derived cycle count are real, read-only T4 measurements. Grease pressure, solenoid commands, and both temperature channels are not yet connected or implemented. Their dashboard cards stay visible and report "Input not configured" until that hardware work is completed.
 - `grease_events.csv` is ready for the future physical injector integration, but it does not create rows until that integration reports an actual firing. The application never invents grease events or pressure data.
 - The diagnostic utility only opens a read-only T4 connection to identify the device; it does not read auxiliary channels or control outputs.
 

@@ -137,8 +137,6 @@ class CsvLogger:
                 "grease_event_ids",
                 "temperature_1_f",
                 "temperature_2_f",
-                "temperature_3_f",
-                "temperature_4_f",
                 "cycle_frequency_cpm",
                 "bushing_data_quality",
             ]
@@ -322,8 +320,6 @@ class CsvLogger:
                 values["grease_event_ids"],
                 values["temp_1"],
                 values["temp_2"],
-                values["temp_3"],
-                values["temp_4"],
                 values["frequency"],
                 values["bushing_data_quality"],
             ]

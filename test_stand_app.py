@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -142,8 +142,6 @@ class CycleCapture:
             # These are deliberately blank until physical temperature inputs exist.
             "temp_1": "",
             "temp_2": "",
-            "temp_3": "",
-            "temp_4": "",
             "frequency": round(frequency, 4),
             "bushing_data_quality": "; ".join(quality) if quality else "complete",
         }
@@ -1295,6 +1293,7 @@ class TestStandApp(tk.Tk):
         self.current_live_run_id: str | None = None
         self.current_live_run_cycle_start = 0
         self.last_tick = time.monotonic()
+        self.test_elapsed_seconds = 0.0
         self.auto_archive_config = self.load_auto_archive_config()
         self.active_auto_archive_config: dict[str, object] | None = None
         self.auto_archive_active = False
@@ -1482,10 +1481,9 @@ class TestStandApp(tk.Tk):
         self._metric(self.metrics, 0, 2, "Bushing Velocity", "velocity", "— °/s", self.velocity_detail_var)
         self._metric(self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", "Rolling 60-second rate")
         self._metric(self.metrics, 0, 4, "Grease Pressure", "pressure", "— psi", "Input not configured")
-        self._metric(self.metrics, 1, 0, "Temperature 1", "temp_1", "— °F", "Input not configured")
-        self._metric(self.metrics, 1, 1, "Temperature 2", "temp_2", "— °F", "Input not configured")
-        self._metric(self.metrics, 1, 2, "Temperature 3", "temp_3", "— °F", "Input not configured")
-        self._metric(self.metrics, 1, 3, "Temperature 4", "temp_4", "— °F", "Input not configured")
+        self._metric(self.metrics, 1, 0, "Test Time", "test_time", "00:00:00", "Active counting time")
+        self._metric(self.metrics, 1, 1, "Temperature 1", "temp_1", "— °F", "Input not configured")
+        self._metric(self.metrics, 1, 2, "Temperature 2", "temp_2", "— °F", "Input not configured")
 
         controls = ttk.LabelFrame(main, text="Test Controls", padding=12)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 10))
@@ -1634,7 +1632,7 @@ class TestStandApp(tk.Tk):
                 "ain2_bushing_position": "LabJack T4 live read-only input",
                 "grease_pressure": "hardware input not configured",
                 "grease_event_analysis": "awaiting physical injector trigger integration",
-                "temperature_1_to_4": "hardware inputs not configured",
+                "temperature_1_to_2": "hardware inputs not configured",
                 "physical_outputs": "not implemented",
             },
         }
@@ -1852,6 +1850,8 @@ class TestStandApp(tk.Tk):
         if self.is_running:
             return
         self.is_running = True
+        self.test_elapsed_seconds = 0.0
+        self.metric_vars["test_time"].set("00:00:00")
         self.cycle_state = "waiting_for_retracted"
         self._cycle_capture = None
         self._begin_live_run()
@@ -1898,9 +1898,11 @@ class TestStandApp(tk.Tk):
                 self._finish_live_run("ended_by_reset")
         self.cycles = 0
         self.cycle_times.clear()
+        self.test_elapsed_seconds = 0.0
         self.cycle_state = "waiting_for_retracted"
         self.metric_vars["cycles"].set("0")
         self.metric_vars["frequency"].set("0.0 cpm")
+        self.metric_vars["test_time"].set("00:00:00")
         if was_running:
             self._begin_live_run()
             self._start_auto_archive_run()
@@ -1918,6 +1920,13 @@ class TestStandApp(tk.Tk):
             return 0.0
         period = self.cycle_times[-1] - self.cycle_times[0]
         return 60 * (len(self.cycle_times) - 1) / period if period else 0.0
+
+    @staticmethod
+    def _format_test_time(seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def load_position_calibration(self) -> dict[str, object] | None:
         calibration = self.paths.read_config("position_calibration.json")
@@ -2526,12 +2535,15 @@ class TestStandApp(tk.Tk):
         elapsed = max(0.0, now - self.last_tick)
         self.last_tick = now
         self._update_live_bushing_position(now)
+        if self.is_running:
+            self.test_elapsed_seconds += elapsed
         if self.is_running and self.auto_archive_active:
             self.auto_archive_elapsed_seconds += elapsed
             if self.auto_archive_elapsed_seconds >= AUTO_ARCHIVE_INTERVAL_SECONDS:
                 self._archive_auto_segment("hourly_archive", "hourly", continue_running=True)
         self.metric_vars["cycles"].set(str(self.cycles))
         self.metric_vars["frequency"].set(f"{self._frequency():0.1f} cpm")
+        self.metric_vars["test_time"].set(self._format_test_time(self.test_elapsed_seconds))
         self.after(UPDATE_MS, self.tick)
 
     def on_close(self) -> None:

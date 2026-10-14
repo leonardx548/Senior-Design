@@ -38,7 +38,7 @@ when counting stops. It retains local data if an archive cannot be created.
 
 Auxiliary channels
 ------------------
-The dashboard includes one grease-pressure card and four temperature cards so
+The dashboard includes one grease-pressure card and two temperature cards so
 the hardware inputs have a defined operator display. Until those inputs are
 implemented, each card reports "Input not configured" rather than a fake
 reading. The empty grease-pressure graph includes a 2,500 psi injector-
