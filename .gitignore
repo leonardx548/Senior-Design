@@ -5,3 +5,6 @@ position_calibration.json
 cycle_stops.json
 *.py[cod]
 .pytest_cache/
+build/
+dist/
+release/

@@ -139,9 +139,18 @@ class LabJackAin2Monitor:
         with self._samples_lock:
             self._stream_samples.clear()
         try:
-            diagnostic = Path(__file__).with_name("labjack_diagnostic.py")
+            if getattr(sys, "frozen", False):
+                # The release package supplies a separate console helper so the
+                # windowed dashboard can still consume its JSON stream safely.
+                diagnostic_command = [
+                    str(Path(sys.executable).with_name("TestStandLabJackDiagnostic.exe")),
+                    "--stream-ain2",
+                ]
+            else:
+                diagnostic = Path(__file__).with_name("labjack_diagnostic.py")
+                diagnostic_command = [sys.executable, str(diagnostic), "--stream-ain2"]
             process = subprocess.Popen(
-                [sys.executable, str(diagnostic), "--stream-ain2"],
+                diagnostic_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.PIPE,
@@ -1690,4 +1699,10 @@ class TestStandApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    # In the packaged release, the GUI launches the dedicated diagnostic helper
+    # for AIN2 streaming. Keep this dispatch for a direct helper invocation too.
+    if any(argument in sys.argv for argument in ("--child-probe", "--sample-ain2", "--stream-ain2", "--json")):
+        from labjack_diagnostic import main as diagnostic_main
+
+        raise SystemExit(diagnostic_main())
     TestStandApp().mainloop()

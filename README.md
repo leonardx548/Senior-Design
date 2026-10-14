@@ -4,14 +4,15 @@ This is a small Windows desktop application for the senior-design bushing test s
 
 ## Quick start for teammates
 
-1. Download and extract the project ZIP from the GitHub Release page.
-2. Install Python 3.10 or newer from [python.org](https://www.python.org/downloads/) and select **Add Python to PATH**.
-3. Double-click [setup_windows.bat](setup_windows.bat). This creates a private `.venv` environment and installs the Python package used for LabJack operation.
-4. Install the official LabJack LJM Windows driver/library for any computer that will use the physical T4.
-5. Double-click [run_diagnostic.bat](run_diagnostic.bat). It must report a successful T4 USB connection before live operation.
-6. Double-click [run_test_stand.bat](run_test_stand.bat).
+1. Download and extract the **Windows application ZIP** from the GitHub Release page.
+2. Double-click `TestStand.exe`.
+3. For a computer using the physical T4, install the official LabJack LJM Windows driver/library once, connect the T4, then run `TestStandLabJackDiagnostic.exe` to confirm the USB connection.
 
-The dashboard can run in simulation mode without the LabJack package or hardware. Live position and cycle counting require the LJM driver/library, the `labjack-ljm` Python package, and a connected T4.
+The release package includes Python and the LabJack Python wrapper; teammates do not need to install Python, create a virtual environment, or run `pip`. The official LabJack LJM Windows driver/library remains a separate installation because it supplies the signed USB driver and native hardware library. The dashboard runs in simulation mode without that driver or a connected T4.
+
+## Development setup
+
+The source ZIP is for development rather than ordinary operation. Install Python 3.10 or newer from [python.org](https://www.python.org/downloads/) and select **Add Python to PATH**, then double-click [setup_windows.bat](setup_windows.bat). Use [run_diagnostic.bat](run_diagnostic.bat) and [run_test_stand.bat](run_test_stand.bat) to run from source.
 
 ## Manual launch
 
@@ -107,7 +108,7 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 
 ## Preparing a GitHub Release
 
-Commit the source files, README, batch files, and `requirements.txt`; do not add `position_calibration.json`, `cycle_stops.json`, `.venv`, or local logs. Create a GitHub Release from a version tag and attach a source ZIP if you want a named downloadable package. Teammates can extract that ZIP and follow **Quick start for teammates** above. Each computer creates its own local calibration and run-log folder on first launch.
+Commit the source files, README, batch files, `requirements.txt`, `build_release.bat`, and `RELEASE_README.txt`; do not add `position_calibration.json`, `cycle_stops.json`, `.venv`, build folders, release ZIPs, or local logs. On the project maintainer's Windows computer, run `build_release.bat`. It creates `release\\SeniorDesignTestStand-v0.1.0-windows.zip`, containing `TestStand.exe`, its bundled runtime files, and the LabJack diagnostic helper. Attach that ZIP to a GitHub Release created from the matching version tag. Each computer creates its own local calibration and run-log folder on first launch.
 
 ## Next practical step when hardware arrives
 
