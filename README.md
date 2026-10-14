@@ -49,14 +49,14 @@ Each automatic ZIP is first written to a temporary file and integrity-checked. O
 
 **File → Export Runs…** remains available as a manual recovery/export tool. It lets an operator select one or more retained live runs and create a portable ZIP. Both automatic and manual archives can include:
 
-- `sensor_readings.csv` — timestamped dashboard measurements;
+- `cycle_summary.csv` — one measured record for each completed reset-to-count stroke;
 - `events.csv` — cycle detections, connection changes, and application events;
 - live-run metadata — start/end status, cycle totals, and whether it has been exported; and
-- `run_configuration.json` — the calibration, cycle stops, grease interval, and logging setup captured when that live run started.
+- `run_configuration.json` — the calibration, cycle stops, and measurement model captured when that live run started.
 
 The ZIP always contains a small `export_manifest.json` and keeps every selected live run inside its own folder. This makes multi-run exports safe to unzip without one run's `events.csv` overwriting another's. Automatic archives clear only their successfully archived local segment; manual exports retain local files. If automatic archiving is not configured, Reset offers the existing manual-export prompt before clearing the dashboard totals.
 
-Use **Edit → Advanced Logging…** (also available from the export window) to choose the standard `sensor_readings.csv` snapshot interval. It starts at **1 second** and accepts any positive interval. Snapshots are recorded while a live run is active. This controls file size only: live AIN2 is still acquired at 200 samples/second for display and cycle detection, and those raw samples are not continuously logged.
+The application does not create a periodic dashboard-snapshot log or retain raw AIN2 samples. It uses the 200 Hz AIN2 stream while each stroke is underway, then writes only its completed-cycle metrics. This keeps long tests compact while preserving the measurements used for comparison.
 
 Use **File → Open Local Data Folder** to inspect the stored configuration and any retained logs in Windows Explorer. **File → Manage Local Data…** lists prior completed application sessions and can permanently remove selected sessions from the local computer. It never lists the application session that is currently open, warns when a selected session contains unexported data, and does not alter exported ZIP files. Calibration and cycle stops remain managed through their own setup dialogs.
 
@@ -80,7 +80,7 @@ Use **Calibrate AIN2 Position** in the dashboard to create a two-point calibrati
 
 The dashboard's **Bushing Position** card and live graph use this real AIN2 feed, not a generated cylinder-position signal. A persistent read-only helper uses the T4's hardware-timed AIN2 stream at 200 samples/second for cycle detection. Every received sample is processed in order for counting; only the displayed card and graph use a five-sample average. Before calibration, the dashboard shows measured AIN2 voltage; after calibration, it shows interpolated bushing angle.
 
-After calibration, the **Bushing Velocity** card and graph use the same raw 200 Hz angle stream. The app fits a straight line through the newest 11 calibrated samples (about 55 ms) and uses its signed slope in degrees/second. A small ±0.25°/s deadband shows stationary motion as zero. Velocity is unavailable outside the calibrated AIN2 span and is included in each `sensor_readings.csv` snapshot as `bushing_velocity_degrees_per_second`.
+After calibration, the **Bushing Velocity** card and graph use the same raw 200 Hz angle stream. The app fits a straight line through the newest 11 calibrated samples (about 55 ms) and uses its signed slope in degrees/second. A small ±0.25°/s deadband shows stationary motion as zero. Velocity is unavailable outside the calibrated AIN2 span. For every completed cycle, the app saves peak velocity plus the median direction-normalized velocity across the middle 90% of the stroke.
 
 ## AIN2 cycle stops and real cycle counting
 
@@ -100,7 +100,7 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 - Live bushing-position and grease-pressure plots. The pressure plot stays empty until its hardware input is implemented and retains a 2,500 psi injector-activation reference line.
 - A compact Recent Events preview plus an **Expand…** button that opens a full-size, live-updating event terminal.
 - Per-run CSV output in `%LOCALAPPDATA%\SeniorDesignTestStand\logs\session_YYYYMMDD_HHMMSS\`:
-  - `sensor_readings.csv` records timestamped readings at the configurable standard snapshot interval (one second by default), with the active live-run ID when applicable.
+  - `cycle_summary.csv` records one row per completed reset-to-count stroke. It includes timing, configured stops, travel direction, peak and median bushing velocity, current CPM, four reserved temperature fields, three reserved grease-pressure-response fields, and a bushing-data-quality indicator.
   - `events.csv` records cycle detections, connection changes, and program events, with the active live-run ID when applicable.
   - `live_runs.json` defines the Start-to-Stop export boundaries and preserves each run's starting configuration.
   - `run_manifest.json` and `run_configuration.json` describe the complete application session.

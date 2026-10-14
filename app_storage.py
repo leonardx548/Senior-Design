@@ -110,31 +110,41 @@ class CsvLogger:
         self.started_monotonic = time.monotonic()
         self.manifest_path = folder / "run_manifest.json"
         self.live_runs_path = folder / LIVE_RUNS_FILENAME
-        self.sensor_file = (folder / "sensor_readings.csv").open("w", newline="", encoding="utf-8")
+        self.cycle_file = (folder / "cycle_summary.csv").open("w", newline="", encoding="utf-8")
         self.event_file = (folder / "events.csv").open("w", newline="", encoding="utf-8")
-        self.sensors = csv.writer(self.sensor_file)
+        self.cycles = csv.writer(self.cycle_file)
         self.events = csv.writer(self.event_file)
-        self.sensors.writerow(
+        self.cycles.writerow(
             [
-                "timestamp",
+                "completed_at",
                 "live_run_id",
-                "elapsed_seconds",
-                "bushing_position",
-                "bushing_position_unit",
-                "bushing_velocity_degrees_per_second",
-                "ain2_voltage_volts",
-                "grease_pressure_psi",
+                "cycle_number",
+                "live_run_cycle_number",
+                "reset_stop_reached_at",
+                "motion_started_at",
+                "count_stop_reached_at",
+                "reset_to_count_duration_seconds",
+                "mid_stroke_duration_seconds",
+                "travel_direction",
+                "reset_stop_degrees",
+                "count_stop_degrees",
+                "bushing_peak_velocity_degrees_per_second",
+                "bushing_peak_signed_velocity_degrees_per_second",
+                "bushing_median_travel_velocity_degrees_per_second",
+                "bushing_velocity_sample_count",
+                "grease_peak_pressure_psi",
+                "grease_pressure_response_time_seconds",
+                "grease_pressure_peak_time_seconds",
                 "temperature_1_f",
                 "temperature_2_f",
                 "temperature_3_f",
                 "temperature_4_f",
-                "completed_cycles",
                 "cycle_frequency_cpm",
-                "auxiliary_input_status",
+                "bushing_data_quality",
             ]
         )
         self.events.writerow(["timestamp", "live_run_id", "event", "detail", "completed_cycles"])
-        self.sensor_file.flush()
+        self.cycle_file.flush()
         self.event_file.flush()
         self._write_manifest({
             "schema_version": 1,
@@ -142,7 +152,7 @@ class CsvLogger:
             "status": "active",
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "ended_at": None,
-            "sensor_log_interval_seconds": None,
+            "data_model": "completed_cycle_summary",
         })
         self._write_live_runs([])
 
@@ -246,7 +256,7 @@ class CsvLogger:
         self.mark_live_runs_exported_in_folder(self.folder, run_ids)
 
     def flush(self) -> None:
-        self.sensor_file.flush()
+        self.cycle_file.flush()
         self.event_file.flush()
 
     def finalize(self, **values: Any) -> None:
@@ -262,27 +272,38 @@ class CsvLogger:
     def timestamp() -> str:
         return datetime.now().isoformat(timespec="seconds")
 
-    def log_reading(self, values: dict[str, float | int | str], live_run_id: str | None = None) -> None:
-        self.sensors.writerow(
+    def log_cycle(self, values: dict[str, float | int | str], live_run_id: str) -> None:
+        """Write one durable record for a completed mechanical cycle."""
+        self.cycles.writerow(
             [
-                self.timestamp(),
-                live_run_id or "",
-                f"{values['elapsed']:.1f}",
-                values["bushing_position"],
-                values["bushing_position_unit"],
-                values["bushing_velocity"],
-                values["ain2_voltage"],
-                values["pressure"],
+                values["completed_at"],
+                live_run_id,
+                values["cycle_number"],
+                values["live_run_cycle_number"],
+                values["reset_stop_reached_at"],
+                values["motion_started_at"],
+                values["count_stop_reached_at"],
+                values["reset_to_count_duration_seconds"],
+                values["mid_stroke_duration_seconds"],
+                values["travel_direction"],
+                values["reset_stop_degrees"],
+                values["count_stop_degrees"],
+                values["bushing_peak_velocity"],
+                values["bushing_peak_signed_velocity"],
+                values["bushing_median_travel_velocity"],
+                values["bushing_velocity_sample_count"],
+                values["grease_peak_pressure"],
+                values["grease_pressure_response_time"],
+                values["grease_pressure_peak_time"],
                 values["temp_1"],
                 values["temp_2"],
                 values["temp_3"],
                 values["temp_4"],
-                values["cycles"],
-                f"{values['frequency']:.2f}",
-                values["auxiliary_status"],
+                values["frequency"],
+                values["bushing_data_quality"],
             ]
         )
-        self.sensor_file.flush()
+        self.cycle_file.flush()
 
     def log_event(self, event: str, detail: str, cycles: int, live_run_id: str | None = None) -> None:
         self.events.writerow([self.timestamp(), live_run_id or "", event, detail, cycles])
@@ -290,5 +311,5 @@ class CsvLogger:
 
     def close(self) -> None:
         self.flush()
-        self.sensor_file.close()
+        self.cycle_file.close()
         self.event_file.close()

@@ -19,7 +19,8 @@ import tkinter as tk
 import webbrowser
 import zipfile
 from collections import deque
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from queue import Empty, Queue
@@ -31,8 +32,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.2.1"
-DEFAULT_SENSOR_LOG_SECONDS = 1.0
+APP_VERSION = "0.3.0"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 AUTO_ARCHIVE_INTERVAL_SECONDS = 60 * 60
@@ -40,6 +40,7 @@ AUTO_ARCHIVE_CONFIG_FILENAME = "auto_archive.json"
 VELOCITY_SLOPE_WINDOW_SAMPLES = 11
 VELOCITY_ZERO_DEADBAND_DPS = 0.25
 DEFAULT_VELOCITY_GRAPH_LIMIT_DPS = 100.0
+CYCLE_MID_STROKE_FRACTION = 0.05
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
 MIN_CYCLE_STOP_SEPARATION_DEGREES = 1.0
 CALIBRATION_STREAM_SAMPLE_COUNT = 100
@@ -47,11 +48,99 @@ LABJACK_LJM_WINDOWS_URL = "https://support.labjack.com/docs/ljm-software-install
 GITHUB_RELEASES_URL = "https://github.com/leonardx548/Senior-Design/releases/latest"
 
 EXPORT_FILE_OPTIONS = (
-    ("sensor", "Sensor readings", "sensor_readings.csv"),
+    ("cycles", "Cycle summary", "cycle_summary.csv"),
     ("events", "Event log", "events.csv"),
     ("metadata", "Run metadata", "live_run.json"),
     ("configuration", "Run configuration", "run_configuration.json"),
 )
+
+
+@dataclass
+class CycleCapture:
+    """In-memory metrics for one reset-stop to count-stop mechanical stroke."""
+
+    reset_stop_reached_at: str
+    reset_stop_monotonic: float
+    reset_stop_degrees: float
+    count_stop_degrees: float
+    direction: int
+    stream_gap_detected: bool = False
+    motion_started_at: str | None = None
+    motion_started_monotonic: float | None = None
+    near_count_stop_at: str | None = None
+    near_count_stop_monotonic: float | None = None
+    peak_velocity: float | None = None
+    peak_signed_velocity: float | None = None
+    mid_stroke_velocities: list[float] = field(default_factory=list)
+
+    def observe(self, angle: float, velocity: float | None, sample_at: str, sample_monotonic: float) -> None:
+        if velocity is not None and (self.peak_velocity is None or abs(velocity) > self.peak_velocity):
+            self.peak_velocity = abs(velocity)
+            self.peak_signed_velocity = velocity
+
+        span = self.count_stop_degrees - self.reset_stop_degrees
+        if not span:
+            return
+        progress = (angle - self.reset_stop_degrees) / span
+        if progress >= CYCLE_MID_STROKE_FRACTION and self.motion_started_monotonic is None:
+            self.motion_started_at = sample_at
+            self.motion_started_monotonic = sample_monotonic
+        if progress >= 1.0 - CYCLE_MID_STROKE_FRACTION and self.near_count_stop_monotonic is None:
+            self.near_count_stop_at = sample_at
+            self.near_count_stop_monotonic = sample_monotonic
+        if CYCLE_MID_STROKE_FRACTION <= progress <= 1.0 - CYCLE_MID_STROKE_FRACTION and velocity is not None:
+            # Normalize to the configured stroke direction, so both wiring/calibration
+            # orientations export a positive travel-speed magnitude.
+            self.mid_stroke_velocities.append(max(0.0, velocity * self.direction))
+
+    def completed_values(
+        self,
+        *,
+        completed_at: str,
+        completed_monotonic: float,
+        cycle_number: int,
+        live_run_cycle_number: int,
+        frequency: float,
+    ) -> dict[str, float | int | str]:
+        quality: list[str] = []
+        if self.stream_gap_detected:
+            quality.append("AIN2 stream gap")
+        if not self.mid_stroke_velocities:
+            quality.append("mid-stroke velocity unavailable")
+        if self.motion_started_monotonic is None or self.near_count_stop_monotonic is None:
+            quality.append("mid-stroke timing unavailable")
+        return {
+            "completed_at": completed_at,
+            "cycle_number": cycle_number,
+            "live_run_cycle_number": live_run_cycle_number,
+            "reset_stop_reached_at": self.reset_stop_reached_at,
+            "motion_started_at": self.motion_started_at or "",
+            "count_stop_reached_at": completed_at,
+            "reset_to_count_duration_seconds": round(completed_monotonic - self.reset_stop_monotonic, 4),
+            "mid_stroke_duration_seconds": (
+                "" if self.motion_started_monotonic is None or self.near_count_stop_monotonic is None
+                else round(self.near_count_stop_monotonic - self.motion_started_monotonic, 4)
+            ),
+            "travel_direction": "increasing angle" if self.direction > 0 else "decreasing angle",
+            "reset_stop_degrees": round(self.reset_stop_degrees, 4),
+            "count_stop_degrees": round(self.count_stop_degrees, 4),
+            "bushing_peak_velocity": "" if self.peak_velocity is None else round(self.peak_velocity, 4),
+            "bushing_peak_signed_velocity": "" if self.peak_signed_velocity is None else round(self.peak_signed_velocity, 4),
+            "bushing_median_travel_velocity": (
+                "" if not self.mid_stroke_velocities else round(statistics.median(self.mid_stroke_velocities), 4)
+            ),
+            "bushing_velocity_sample_count": len(self.mid_stroke_velocities),
+            # These are deliberately blank until physical pressure and temperature inputs exist.
+            "grease_peak_pressure": "",
+            "grease_pressure_response_time": "",
+            "grease_pressure_peak_time": "",
+            "temp_1": "",
+            "temp_2": "",
+            "temp_3": "",
+            "temp_4": "",
+            "frequency": round(frequency, 4),
+            "bushing_data_quality": "; ".join(quality) if quality else "complete",
+        }
 
 
 def format_local_timestamp(value: object, fallback: str = "Not available") -> str:
@@ -119,13 +208,19 @@ def write_live_run_archive(
                 run_id = str(run["id"])
                 archive_folder = f"{folder.name}/{run_id}"
                 for key, _label, filename in options:
-                    if key in {"sensor", "events"}:
+                    archive_filename = filename
+                    if key in {"cycles", "events"}:
                         contents = filtered_live_run_csv(folder, filename, run_id)
+                        # Older local sessions used the retired snapshot log. Keep
+                        # those records exportable without producing a mislabeled CSV.
+                        if key == "cycles" and not contents and (folder / "sensor_readings.csv").is_file():
+                            archive_filename = "sensor_readings.csv"
+                            contents = filtered_live_run_csv(folder, archive_filename, run_id)
                     elif key == "metadata":
                         contents = json.dumps(run, indent=2)
                     else:
                         contents = json.dumps(run.get("configuration", {}), indent=2)
-                    archive.writestr(f"{archive_folder}/{filename}", contents)
+                    archive.writestr(f"{archive_folder}/{archive_filename}", contents)
                     count += 1
         with zipfile.ZipFile(temporary, "r") as archive:
             if archive.testzip() is not None:
@@ -632,68 +727,6 @@ class CycleStopsDialog(tk.Toplevel):
             self.status_var.set("Cycle stops cleared. Cycle counting is disabled.")
 
 
-class AdvancedLoggingDialog(tk.Toplevel):
-    """Choose how often normal dashboard snapshots are added to the CSV log."""
-
-    INTERVAL_CHOICES = ("0.1", "0.2", "0.5", "1", "2", "5", "10")
-
-    def __init__(self, app: "TestStandApp") -> None:
-        super().__init__(app)
-        self.app = app
-        self.title("Advanced Logging")
-        self.resizable(False, False)
-        self.transient(app)
-        self.interval_var = tk.StringVar(value=f"{app.sensor_log_interval_seconds:g}")
-        self._build()
-        self.lift()
-        self.focus_force()
-
-    def _build(self) -> None:
-        outer = ttk.Frame(self, padding=18)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Standard sensor-log rate", font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Choose how often live-run dashboard readings are written to the CSV. This does not affect cycle counting.",
-            wraplength=510,
-            foreground="#475569",
-        ).pack(anchor="w", pady=(5, 13))
-
-        form = ttk.Frame(outer)
-        form.pack(fill="x")
-        ttk.Label(form, text="Record one snapshot every").grid(row=0, column=0, sticky="w")
-        interval = ttk.Combobox(
-            form,
-            textvariable=self.interval_var,
-            values=self.INTERVAL_CHOICES,
-            state="normal",
-            width=8,
-        )
-        interval.grid(row=0, column=1, padx=(8, 5))
-        ttk.Label(form, text="seconds").grid(row=0, column=2, sticky="w")
-        ttk.Label(
-            outer,
-            text="AIN2 continues at 200 samples/second for the display and cycle detector; raw samples are not saved.",
-            wraplength=510,
-            foreground="#1e3a8a",
-        ).pack(anchor="w", pady=(13, 15))
-        buttons = ttk.Frame(outer)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Apply", style="Grease.TButton", command=self.apply).pack(side="left")
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
-
-    def apply(self) -> None:
-        try:
-            interval_seconds = float(self.interval_var.get())
-            if interval_seconds <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid log rate", "Enter a positive number of seconds.", parent=self)
-            return
-        self.app.set_sensor_log_interval(interval_seconds)
-        self.destroy()
-
-
 class ExportDataDialog(tk.Toplevel):
     """Export logical Start-to-Stop test runs retained in local staging."""
 
@@ -755,7 +788,6 @@ class ExportDataDialog(tk.Toplevel):
         )
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Advanced Logging…", command=self.app.open_advanced_logging_window).pack(side="left")
         ttk.Button(buttons, text="Export Selected…", style="Grease.TButton", command=self.export).pack(side="right")
 
     def refresh_runs(self) -> None:
@@ -1099,9 +1131,8 @@ class TestStandApp(tk.Tk):
         self.logger = CsvLogger(self.paths.logs)
         self.is_running = False
         self.current_live_run_id: str | None = None
+        self.current_live_run_cycle_start = 0
         self.last_tick = time.monotonic()
-        self.last_sensor_log = 0.0
-        self.sensor_log_interval_seconds = DEFAULT_SENSOR_LOG_SECONDS
         self.auto_archive_config = self.load_auto_archive_config()
         self.active_auto_archive_config: dict[str, object] | None = None
         self.auto_archive_active = False
@@ -1110,6 +1141,7 @@ class TestStandApp(tk.Tk):
         self.cycles = 0
         self.cycle_state = "waiting_for_retracted"
         self.cycle_times: deque[float] = deque()
+        self._cycle_capture: CycleCapture | None = None
         self.position_calibration = self.load_position_calibration()
         self.cycle_stops = self.load_cycle_stops()
         self.ain2_monitor = LabJackAin2Monitor()
@@ -1134,7 +1166,7 @@ class TestStandApp(tk.Tk):
         self._set_labjack_dependent_controls(False)
         self.logger.update_manifest(
             app_version=APP_VERSION,
-            sensor_log_interval_seconds=self.sensor_log_interval_seconds,
+            data_model="completed_cycle_summary",
         )
         self._write_run_configuration_snapshot()
         self.log_event("Application started", f"CSV folder: {self.logger.folder}")
@@ -1181,9 +1213,6 @@ class TestStandApp(tk.Tk):
         file_menu.add_command(label="Open Local Data Folder", command=self.open_local_data_folder)
         file_menu.add_command(label="Manage Local Data…", command=self.open_local_data_window)
         menu_bar.add_cascade(label="File", menu=file_menu)
-        edit_menu = tk.Menu(menu_bar, tearoff=False)
-        edit_menu.add_command(label="Advanced Logging…", command=self.open_advanced_logging_window)
-        menu_bar.add_cascade(label="Edit", menu=edit_menu)
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="Getting Started…", command=self.open_getting_started_window)
         menu_bar.add_cascade(label="Help", menu=help_menu)
@@ -1406,7 +1435,11 @@ class TestStandApp(tk.Tk):
             "schema_version": 1,
             "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "app_version": APP_VERSION,
-            "sensor_log_interval_seconds": self.sensor_log_interval_seconds,
+            "data_model": {
+                "primary_record": "one summary row per completed cycle",
+                "raw_ain2_samples_persisted": False,
+                "dashboard_snapshot_log": False,
+            },
             "automatic_archive": {
                 "enabled": self.auto_archive_config["enabled"],
                 "interval_seconds": AUTO_ARCHIVE_INTERVAL_SECONDS,
@@ -1466,10 +1499,9 @@ class TestStandApp(tk.Tk):
         self.logger = CsvLogger(self.paths.logs)
         self.logger.update_manifest(
             app_version=APP_VERSION,
-            sensor_log_interval_seconds=self.sensor_log_interval_seconds,
+            data_model="completed_cycle_summary",
         )
         self._write_run_configuration_snapshot()
-        self.last_sensor_log = time.monotonic()
 
     def _start_auto_archive_run(self) -> None:
         self.auto_archive_elapsed_seconds = 0.0
@@ -1576,10 +1608,13 @@ class TestStandApp(tk.Tk):
     def _begin_live_run(self) -> None:
         live_run = self.logger.begin_live_run(self._run_configuration_values(), self.cycles)
         self.current_live_run_id = str(live_run["id"])
+        self.current_live_run_cycle_start = int(live_run["completed_cycles_at_start"])
 
     def _finish_live_run(self, status: str) -> None:
         if not self.current_live_run_id:
             return
+        self._discard_cycle_capture("Live run ended before the count stop was reached.")
+        self.cycle_state = "waiting_for_retracted"
         self.logger.finish_live_run(
             self.current_live_run_id,
             status=status,
@@ -1597,16 +1632,6 @@ class TestStandApp(tk.Tk):
             if not run.get("exported_at"):
                 return run
         return None
-
-    def set_sensor_log_interval(self, interval_seconds: float) -> None:
-        self.sensor_log_interval_seconds = interval_seconds
-        self.last_sensor_log = time.monotonic()
-        self.logger.update_manifest(sensor_log_interval_seconds=interval_seconds)
-        self._write_run_configuration_snapshot()
-        self.log_event(
-            "Sensor log rate changed",
-            f"Standard dashboard snapshots now record every {interval_seconds:g} seconds.",
-        )
 
     def _set_labjack_dependent_controls(self, available: bool) -> None:
         """Enable only actions that have a confirmed live T4 behind them."""
@@ -1642,6 +1667,7 @@ class TestStandApp(tk.Tk):
             return
         self.is_running = True
         self.cycle_state = "waiting_for_retracted"
+        self._cycle_capture = None
         self._begin_live_run()
         self._start_auto_archive_run()
         self.start_button.configure(state="disabled")
@@ -1725,6 +1751,7 @@ class TestStandApp(tk.Tk):
         self.bushing_unit = "degrees"
         self.configure_bushing_plot()
         self.configure_velocity_plot()
+        self._cycle_capture = None
         self._write_run_configuration_snapshot()
 
     def clear_position_calibration(self) -> None:
@@ -1733,6 +1760,7 @@ class TestStandApp(tk.Tk):
         self.bushing_unit = "volts"
         self.configure_bushing_plot()
         self.configure_velocity_plot()
+        self._cycle_capture = None
         self._write_run_configuration_snapshot()
         self.log_event("AIN2 calibration cleared", "Saved two-point AIN2 calibration removed.")
 
@@ -1760,6 +1788,7 @@ class TestStandApp(tk.Tk):
         self.paths.write_config("cycle_stops.json", stops)
         self.cycle_stops = {"retracted": float(stops["retracted"]), "extended": float(stops["extended"])}
         self.cycle_state = "waiting_for_retracted"
+        self._cycle_capture = None
         self.cycle_stops_var.set(self.cycle_stops_summary())
         self.configure_bushing_plot(clear_samples=False)
         self._write_run_configuration_snapshot()
@@ -1772,6 +1801,7 @@ class TestStandApp(tk.Tk):
         self.paths.remove_config("cycle_stops.json")
         self.cycle_stops = None
         self.cycle_state = "waiting_for_retracted"
+        self._cycle_capture = None
         self.cycle_stops_var.set(self.cycle_stops_summary())
         self.configure_bushing_plot(clear_samples=False)
         self._write_run_configuration_snapshot()
@@ -1869,7 +1899,22 @@ class TestStandApp(tk.Tk):
         self.metric_vars["velocity"].set(f"{self.bushing_velocity:+.2f} °/s")
         self.velocity_plot.add(self.bushing_velocity)
 
-    def _update_cycle_count_from_bushing(self, angle: float) -> None:
+    def _start_cycle_capture(self, retracted: float, extended: float, sample_at: str, sample_monotonic: float) -> None:
+        self._cycle_capture = CycleCapture(
+            reset_stop_reached_at=sample_at,
+            reset_stop_monotonic=sample_monotonic,
+            reset_stop_degrees=retracted,
+            count_stop_degrees=extended,
+            direction=1 if extended > retracted else -1,
+        )
+
+    def _discard_cycle_capture(self, reason: str) -> None:
+        """Do not write a summary for a partial stroke; retain its reason in events."""
+        if self._cycle_capture is not None:
+            self.log_event("Partial cycle discarded", reason)
+        self._cycle_capture = None
+
+    def _update_cycle_count_from_bushing(self, angle: float, sample_at: str, sample_monotonic: float) -> None:
         """Use direction-independent stop hysteresis to count real motion once per stroke."""
         if not self.is_running or not self.cycle_stops:
             return
@@ -1878,17 +1923,32 @@ class TestStandApp(tk.Tk):
         at_retracted = angle <= retracted if increasing else angle >= retracted
         at_extended = angle >= extended if increasing else angle <= extended
         if at_retracted:
+            if self.cycle_state != "ready_for_extension":
+                self._start_cycle_capture(retracted, extended, sample_at, sample_monotonic)
             self.cycle_state = "ready_for_extension"
             return
-        if not at_extended or self.cycle_state != "ready_for_extension":
+        if self.cycle_state != "ready_for_extension":
+            return
+        if self._cycle_capture is not None:
+            self._cycle_capture.observe(angle, self.bushing_velocity, sample_at, sample_monotonic)
+        if not at_extended:
             return
         self.cycle_state = "waiting_for_retracted"
         self.cycles += 1
-        now = time.monotonic()
-        self.cycle_times.append(now)
+        self.cycle_times.append(sample_monotonic)
+        if self._cycle_capture is not None and self.current_live_run_id:
+            values = self._cycle_capture.completed_values(
+                completed_at=sample_at,
+                completed_monotonic=sample_monotonic,
+                cycle_number=self.cycles,
+                live_run_cycle_number=self.cycles - self.current_live_run_cycle_start,
+                frequency=self._frequency(),
+            )
+            self.logger.log_cycle(values, self.current_live_run_id)
+            self._cycle_capture = None
         self.log_event(
             "Cycle detected",
-            f"Live bushing reached count stop ({extended:.3f}°) after reset stop ({retracted:.3f}°).",
+            f"Cycle {self.cycles} reached count stop ({extended:.3f}°) after reset stop ({retracted:.3f}°).",
         )
 
     def _update_live_bushing_position(self, now: float) -> None:
@@ -1918,12 +1978,22 @@ class TestStandApp(tk.Tk):
                     self.bushing_velocity = None
                     self.metric_vars["velocity"].set("— °/s")
                     self.velocity_detail_var.set("AIN2 stream gap — velocity rearming")
-                for raw_voltage in result.get("samples", []):
+                    if self._cycle_capture is not None:
+                        self._cycle_capture.stream_gap_detected = True
+                samples = result.get("samples", [])
+                if not isinstance(samples, list):
+                    samples = []
+                batch_end_at = datetime.now().astimezone()
+                batch_end_monotonic = time.monotonic()
+                for index, raw_voltage in enumerate(samples):
                     try:
                         voltage = float(raw_voltage)
                     except (TypeError, ValueError):
                         continue
-                    self._process_counting_voltage(voltage, scan_rate_hz)
+                    seconds_before_end = (len(samples) - 1 - index) / max(scan_rate_hz, 1.0)
+                    sample_monotonic = batch_end_monotonic - seconds_before_end
+                    sample_at = (batch_end_at - timedelta(seconds=seconds_before_end)).isoformat(timespec="milliseconds")
+                    self._process_counting_voltage(voltage, scan_rate_hz, sample_at, sample_monotonic)
                     latest_voltage = voltage
             elif result.get("status") == "disconnected":
                 self._set_labjack_connection_state(
@@ -1936,19 +2006,22 @@ class TestStandApp(tk.Tk):
             self._render_live_bushing_position(statistics.fmean(self._display_voltage_samples))
             self._render_bushing_velocity()
 
-    def _process_counting_voltage(self, voltage: float, scan_rate_hz: float) -> None:
+    def _process_counting_voltage(
+        self, voltage: float, scan_rate_hz: float, sample_at: str, sample_monotonic: float
+    ) -> None:
         """Feed each hardware-timed sample to the detector; never reject it for motion."""
         self._display_voltage_samples.append(voltage)
         if self.position_calibration:
             angle, outside = self.angle_from_voltage(voltage, self.position_calibration)
             if not outside:
-                self._update_cycle_count_from_bushing(angle)
                 self._update_bushing_velocity(angle, scan_rate_hz)
+                self._update_cycle_count_from_bushing(angle, sample_at, sample_monotonic)
             else:
                 self._velocity_angles.clear()
                 self.bushing_velocity = None
                 self.metric_vars["velocity"].set("— °/s")
                 self.velocity_detail_var.set("Outside calibrated AIN2 span")
+                self._discard_cycle_capture("AIN2 left the calibrated span before reaching the count stop.")
 
     def _render_live_bushing_position(self, voltage: float) -> None:
         """Render a short display-only average without affecting cycle detection."""
@@ -1987,9 +2060,6 @@ class TestStandApp(tk.Tk):
 
     def open_local_data_window(self) -> None:
         LocalDataDialog(self)
-
-    def open_advanced_logging_window(self) -> None:
-        AdvancedLoggingDialog(self)
 
     def open_cycle_stops_window(self) -> None:
         if not self.labjack_available:
@@ -2031,24 +2101,6 @@ class TestStandApp(tk.Tk):
             self.last_labjack_signature = signature
             self.log_event(event, event_detail)
 
-    def _values(self) -> dict[str, float | int | str]:
-        frequency = self._frequency()
-        return {
-            "elapsed": time.monotonic() - self.logger.started_monotonic,
-            "bushing_position": "" if self.bushing_position is None else f"{self.bushing_position:.4f}",
-            "bushing_position_unit": self.bushing_unit if self.bushing_position is not None else "",
-            "bushing_velocity": "" if self.bushing_velocity is None else f"{self.bushing_velocity:.4f}",
-            "ain2_voltage": "" if self.ain2_voltage is None else f"{self.ain2_voltage:.5f}",
-            "pressure": "" if self.grease_pressure is None else self.grease_pressure,
-            "temp_1": "",
-            "temp_2": "",
-            "temp_3": "",
-            "temp_4": "",
-            "cycles": self.cycles,
-            "frequency": frequency,
-            "auxiliary_status": "not configured" if self.grease_pressure is None else "partially active",
-        }
-
     def record_grease_pressure(self, pressure_psi: float) -> None:
         """Accept a real grease-pressure reading when that input is implemented.
 
@@ -2074,12 +2126,8 @@ class TestStandApp(tk.Tk):
             self.auto_archive_elapsed_seconds += elapsed
             if self.auto_archive_elapsed_seconds >= AUTO_ARCHIVE_INTERVAL_SECONDS:
                 self._archive_auto_segment("hourly_archive", "hourly", continue_running=True)
-        values = self._values()
         self.metric_vars["cycles"].set(str(self.cycles))
-        self.metric_vars["frequency"].set(f"{values['frequency']:0.1f} cpm")
-        if self.current_live_run_id and now - self.last_sensor_log >= self.sensor_log_interval_seconds:
-            self.logger.log_reading(values, live_run_id=self.current_live_run_id)
-            self.last_sensor_log = now
+        self.metric_vars["frequency"].set(f"{self._frequency():0.1f} cpm")
         self.after(UPDATE_MS, self.tick)
 
     def on_close(self) -> None:
