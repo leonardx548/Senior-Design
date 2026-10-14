@@ -24,6 +24,23 @@ CONFIG_FILENAMES = ("position_calibration.json", "cycle_stops.json")
 LIVE_RUNS_FILENAME = "live_runs.json"
 
 
+def write_json_atomic(path: Path, values: Any) -> None:
+    """Commit a JSON record only after its contents have reached the local disk."""
+    temporary = path.with_suffix(".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(values, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 @dataclass(frozen=True)
 class AppPaths:
     """The machine-local data layout used by the desktop application."""
@@ -66,10 +83,7 @@ class AppPaths:
             return None
 
     def write_config(self, filename: str, value: dict[str, Any]) -> None:
-        target = self.config / filename
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
-        temporary.replace(target)
+        write_json_atomic(self.config / filename, value)
 
     def remove_config(self, filename: str) -> None:
         try:
@@ -167,9 +181,7 @@ class CsvLogger:
             ]
         )
         self.events.writerow(["timestamp", "live_run_id", "event", "detail", "completed_cycles"])
-        self.cycle_file.flush()
-        self.grease_file.flush()
-        self.event_file.flush()
+        self.flush()
         self._write_manifest({
             "schema_version": 2,
             "run_id": folder.name,
@@ -182,9 +194,7 @@ class CsvLogger:
 
     @staticmethod
     def _write_json_atomic(path: Path, values: Any) -> None:
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(values, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        write_json_atomic(path, values)
 
     def _write_manifest(self, values: dict[str, Any]) -> None:
         self._write_json_atomic(self.manifest_path, values)
@@ -280,9 +290,9 @@ class CsvLogger:
         self.mark_live_runs_exported_in_folder(self.folder, run_ids)
 
     def flush(self) -> None:
-        self.cycle_file.flush()
-        self.grease_file.flush()
-        self.event_file.flush()
+        for output in (self.cycle_file, self.grease_file, self.event_file):
+            output.flush()
+            os.fsync(output.fileno())
 
     def finalize(self, **values: Any) -> None:
         self.flush()
@@ -325,10 +335,12 @@ class CsvLogger:
             ]
         )
         self.cycle_file.flush()
+        os.fsync(self.cycle_file.fileno())
 
     def log_event(self, event: str, detail: str, cycles: int, live_run_id: str | None = None) -> None:
         self.events.writerow([self.timestamp(), live_run_id or "", event, detail, cycles])
         self.event_file.flush()
+        os.fsync(self.event_file.fileno())
 
     def log_grease_event(self, values: dict[str, float | int | str], live_run_id: str) -> None:
         """Write one injection record with its associated pre/post cycle comparison."""
@@ -358,6 +370,7 @@ class CsvLogger:
             ]
         )
         self.grease_file.flush()
+        os.fsync(self.grease_file.fileno())
 
     def close(self) -> None:
         self.flush()

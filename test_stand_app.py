@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import csv
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -33,7 +34,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.15"
+APP_VERSION = "0.3.16"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -1457,6 +1458,8 @@ class TestStandApp(tk.Tk):
         self.logger = CsvLogger(self.paths.logs)
         self.is_running = False
         self.current_live_run_id: str | None = None
+        self._closing = False
+        self._last_runtime_error = ""
         self.current_live_run_cycle_start = 0
         self.last_tick = time.monotonic()
         self.test_elapsed_seconds = 0.0
@@ -1984,11 +1987,21 @@ class TestStandApp(tk.Tk):
             return False
 
         cleanup_error: OSError | ValueError | None = None
+        other_runs = [item for item in runs if item.get("id") != run_id]
+        if other_runs:
+            # One CSV session can contain runs created before automatic
+            # archiving was enabled or after a prior archive failure. Never
+            # remove that shared folder after exporting only the current run.
+            try:
+                CsvLogger.mark_live_runs_exported_in_folder(self.logger.folder, {run_id})
+            except (OSError, ValueError) as error:
+                cleanup_error = error
         self.logger.close()
-        try:
-            self.paths.delete_run_directory(self.logger.folder)
-        except (OSError, ValueError) as error:
-            cleanup_error = error
+        if not other_runs:
+            try:
+                self.paths.delete_run_directory(self.logger.folder)
+            except (OSError, ValueError) as error:
+                cleanup_error = error
         self._replace_logger()
         self.auto_archive_elapsed_seconds = 0.0
 
@@ -2007,6 +2020,11 @@ class TestStandApp(tk.Tk):
             self.log_event(
                 "Archive cleanup incomplete",
                 f"The ZIP was created, but the local segment could not be removed: {cleanup_error}",
+            )
+        elif other_runs:
+            self.log_event(
+                "Archive local data retained",
+                f"The ZIP was created; {len(other_runs)} earlier live run(s) remain available for manual export.",
             )
         return True
 
@@ -2047,16 +2065,6 @@ class TestStandApp(tk.Tk):
     def _set_labjack_dependent_controls(self, available: bool) -> None:
         """Enable only actions that have a confirmed live T4 behind them."""
         self.labjack_available = available
-        action_state = "normal" if available else "disabled"
-        self.calibrate_button.configure(state=action_state)
-        self.cycle_stops_button.configure(state=action_state)
-        if available and self.is_running:
-            self.start_button.configure(state="disabled")
-            self.stop_button.configure(state="normal")
-            return
-
-        self.start_button.configure(state=action_state)
-        self.stop_button.configure(state="disabled")
         if not available and self.is_running:
             self.is_running = False
             self.cycle_state = "waiting_for_retracted"
@@ -2065,12 +2073,38 @@ class TestStandApp(tk.Tk):
                 self._archive_auto_segment("interrupted_by_disconnect", "interrupted", continue_running=False)
             else:
                 self._finish_live_run("interrupted_by_disconnect")
+        setup_state = "normal" if available and not self.is_running else "disabled"
+        cycle_stops_state = "normal" if setup_state == "normal" and self.position_calibration else "disabled"
+        count_ready = bool(available and self.position_calibration and self.cycle_stops)
+        self.calibrate_button.configure(state=setup_state)
+        self.cycle_stops_button.configure(state=cycle_stops_state)
+        if self.is_running:
+            self.start_button.configure(state="disabled")
+            self.stop_button.configure(state="normal" if available else "disabled")
+            return
+
+        self.start_button.configure(state="normal" if count_ready else "disabled")
+        self.stop_button.configure(state="disabled")
 
     def start_counting(self) -> None:
         if not self.labjack_available:
             messagebox.showerror(
                 "LabJack required",
                 "Connect the LabJack T4 and wait for AIN2 to become active before starting cycle counting.",
+                parent=self,
+            )
+            return
+        if not self.position_calibration:
+            messagebox.showerror(
+                "Calibration required",
+                "Save the two-point AIN2 position calibration before starting cycle counting.",
+                parent=self,
+            )
+            return
+        if not self.cycle_stops:
+            messagebox.showerror(
+                "Cycle stops required",
+                "Set the reset and count stops before starting cycle counting.",
                 parent=self,
             )
             return
@@ -2083,8 +2117,7 @@ class TestStandApp(tk.Tk):
         self._cycle_capture = None
         self._begin_live_run()
         self._start_auto_archive_run()
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
+        self._set_labjack_dependent_controls(True)
         if self.cycle_stops:
             self.log_event("Cycle counting started", "Waiting for the reset stop.")
         else:
@@ -2094,8 +2127,7 @@ class TestStandApp(tk.Tk):
         if not self.is_running:
             return
         self.is_running = False
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
+        self._set_labjack_dependent_controls(self.labjack_available)
         self.log_event("Cycle counting stopped", "Cycle and CPM totals retained.")
         if self.auto_archive_active:
             self._archive_auto_segment("stopped", "final", continue_running=False)
@@ -2133,7 +2165,10 @@ class TestStandApp(tk.Tk):
         if was_running:
             self._begin_live_run()
             self._start_auto_archive_run()
+            self._set_labjack_dependent_controls(self.labjack_available)
             self.log_event("Live run started", "Cycle and CPM totals were reset.")
+        else:
+            self._set_labjack_dependent_controls(self.labjack_available)
         self.log_event(
             "Cycle counting reset",
             "Cycle and CPM totals cleared.",
@@ -2176,6 +2211,7 @@ class TestStandApp(tk.Tk):
         self._cycle_capture = None
         self._clear_snapshot_history()
         self._write_run_configuration_snapshot()
+        self._set_labjack_dependent_controls(self.labjack_available)
 
     def clear_position_calibration(self) -> None:
         self.paths.remove_config("position_calibration.json")
@@ -2186,6 +2222,7 @@ class TestStandApp(tk.Tk):
         self._cycle_capture = None
         self._clear_snapshot_history()
         self._write_run_configuration_snapshot()
+        self._set_labjack_dependent_controls(self.labjack_available)
         self.log_event("AIN2 calibration cleared", "Saved two-point AIN2 calibration removed.")
 
     def load_cycle_stops(self) -> dict[str, float] | None:
@@ -2216,6 +2253,7 @@ class TestStandApp(tk.Tk):
         self.cycle_stops_var.set(self.cycle_stops_summary())
         self.configure_bushing_plot(clear_samples=False)
         self._write_run_configuration_snapshot()
+        self._set_labjack_dependent_controls(self.labjack_available)
         self.log_event(
             "Cycle stops saved",
             f"Reset at {self.cycle_stops['retracted']:.3f}°; count at {self.cycle_stops['extended']:.3f}°.",
@@ -2229,6 +2267,7 @@ class TestStandApp(tk.Tk):
         self.cycle_stops_var.set(self.cycle_stops_summary())
         self.configure_bushing_plot(clear_samples=False)
         self._write_run_configuration_snapshot()
+        self._set_labjack_dependent_controls(self.labjack_available)
         self.log_event("Cycle stops cleared", "Live AIN2 cycle counting disabled until two new stops are saved.")
 
     @staticmethod
@@ -2700,13 +2739,15 @@ class TestStandApp(tk.Tk):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         destination = output_root / f"Snapshot_{timestamp}"
         suffix = 2
-        while destination.exists():
+        temporary_destination = output_root / f".{destination.name}.tmp"
+        while destination.exists() or temporary_destination.exists():
             destination = output_root / f"Snapshot_{timestamp}_{suffix:02d}"
+            temporary_destination = output_root / f".{destination.name}.tmp"
             suffix += 1
         try:
             output_root.mkdir(parents=True, exist_ok=True)
-            destination.mkdir()
-            data_file = destination / "position_velocity_200hz.csv"
+            temporary_destination.mkdir()
+            data_file = temporary_destination / "position_velocity_200hz.csv"
             first_time = samples[0].monotonic_seconds
             with data_file.open("w", newline="", encoding="utf-8") as source:
                 writer = csv.writer(source)
@@ -2729,8 +2770,8 @@ class TestStandApp(tk.Tk):
                         "" if sample.velocity_degrees_per_second is None else f"{sample.velocity_degrees_per_second:.6f}",
                         "yes" if sample.stream_gap_before else "",
                     ])
-            LivePlot.write_svg(destination / "position_graph.svg", position_graph)
-            LivePlot.write_svg(destination / "velocity_graph.svg", velocity_graph)
+            LivePlot.write_svg(temporary_destination / "position_graph.svg", position_graph)
+            LivePlot.write_svg(temporary_destination / "velocity_graph.svg", velocity_graph)
             metadata = {
                 "schema_version": 1,
                 "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -2745,8 +2786,12 @@ class TestStandApp(tk.Tk):
                 "cycle_stops": self.cycle_stops,
                 "files": ["position_velocity_200hz.csv", "position_graph.svg", "velocity_graph.svg"],
             }
-            (destination / "snapshot_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        except (OSError, csv.Error, ValueError) as error:
+            (temporary_destination / "snapshot_metadata.json").write_text(
+                json.dumps(metadata, indent=2), encoding="utf-8"
+            )
+            temporary_destination.replace(destination)
+        except Exception as error:
+            shutil.rmtree(temporary_destination, ignore_errors=True)
             messagebox.showerror("Snapshot export failed", f"Could not save the graph snapshot:\n{error}", parent=self)
             return
         self.log_event("Graph snapshot saved", f"{destination.name}: {len(samples):,} full-rate AIN2 samples.")
@@ -2789,6 +2834,7 @@ class TestStandApp(tk.Tk):
         if state == "connected":
             text, color = "LabJack T4 • Connected • USB", "#86efac"
             event, event_detail = "LabJack connected", "AIN2 sampling active."
+            self._last_runtime_error = ""
         elif state == "disconnected":
             text, color = "LabJack T4 • Disconnected", "#fbbf24"
             event, event_detail = "LabJack disconnected", detail
@@ -2876,44 +2922,87 @@ class TestStandApp(tk.Tk):
             event.record_pressure(value, sample_at, sample_monotonic)
 
     def tick(self) -> None:
-        now = time.monotonic()
-        elapsed = max(0.0, now - self.last_tick)
-        self.last_tick = now
-        self._update_live_bushing_position(now)
-        if self.is_running:
-            self.test_elapsed_seconds += elapsed
-        if self.is_running and self.auto_archive_active:
-            self.auto_archive_elapsed_seconds += elapsed
-            interval_seconds = int(self.active_auto_archive_config["interval_seconds"])
-            if self.auto_archive_elapsed_seconds >= interval_seconds:
-                self._archive_auto_segment("scheduled_archive", "scheduled", continue_running=True)
-        self.metric_vars["cycles"].set(str(self.cycles))
-        self.metric_vars["frequency"].set(f"{self._frequency():0.1f} cpm")
-        self.metric_vars["test_time"].set(self._format_test_time(self.test_elapsed_seconds))
-        self.after(UPDATE_MS, self.tick)
+        try:
+            now = time.monotonic()
+            elapsed = max(0.0, now - self.last_tick)
+            self.last_tick = now
+            self._update_live_bushing_position(now)
+            if self.is_running:
+                self.test_elapsed_seconds += elapsed
+            if self.is_running and self.auto_archive_active:
+                self.auto_archive_elapsed_seconds += elapsed
+                interval_seconds = int(self.active_auto_archive_config["interval_seconds"])
+                if self.auto_archive_elapsed_seconds >= interval_seconds:
+                    self._archive_auto_segment("scheduled_archive", "scheduled", continue_running=True)
+            self.metric_vars["cycles"].set(str(self.cycles))
+            self.metric_vars["frequency"].set(f"{self._frequency():0.1f} cpm")
+            self.metric_vars["test_time"].set(self._format_test_time(self.test_elapsed_seconds))
+        except Exception as error:
+            self._handle_runtime_error(error)
+        finally:
+            if not self._closing:
+                try:
+                    self.after(UPDATE_MS, self.tick)
+                except tk.TclError:
+                    pass
+
+    def _handle_runtime_error(self, error: Exception) -> None:
+        """Keep the UI responsive and make an unexpected monitor failure visible."""
+        detail = f"{type(error).__name__}: {error}"
+        try:
+            self.labjack_status_var.set("LabJack T4 • Monitoring error")
+            self.labjack_status_label.configure(foreground="#fca5a5")
+            self.bushing_detail_var.set("AIN2 monitor error — see Recent Events")
+        except (AttributeError, tk.TclError):
+            pass
+        if detail == self._last_runtime_error:
+            return
+        self._last_runtime_error = detail
+        try:
+            self.log_event("Application monitoring error", detail)
+        except Exception:
+            # A full or unavailable local disk must not prevent the Tk event
+            # loop from scheduling its next chance to recover.
+            pass
 
     def on_close(self) -> None:
-        if self.is_running:
-            self.is_running = False
-            self.log_event("Live run interrupted", "Application closed while cycle counting was active.")
-            if self.auto_archive_active:
-                self._archive_auto_segment("interrupted_by_application_close", "interrupted", continue_running=False)
-            else:
-                self._finish_live_run("interrupted_by_application_close")
-        self.log_event("Application closed", "Operator closed the application.")
-        self.ain2_monitor.close()
-        self.logger.finalize(
-            completed_cycles=self.cycles,
-            cycle_frequency_cpm=round(self._frequency(), 2),
-            final_auxiliary_status="not_configured",
-        )
-        self.logger.close()
-        if not CsvLogger.read_live_runs(self.logger.folder):
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            if self.is_running:
+                self.is_running = False
+                self.log_event("Live run interrupted", "Application closed while cycle counting was active.")
+                if self.auto_archive_active:
+                    self._archive_auto_segment("interrupted_by_application_close", "interrupted", continue_running=False)
+                else:
+                    self._finish_live_run("interrupted_by_application_close")
+            self.log_event("Application closed", "Operator closed the application.")
+        except Exception as error:
+            self._handle_runtime_error(error)
+        finally:
             try:
-                self.paths.delete_run_directory(self.logger.folder)
-            except (OSError, ValueError):
-                pass
-        self.destroy()
+                self.ain2_monitor.close()
+            finally:
+                logger_folder = self.logger.folder
+                try:
+                    self.logger.finalize(
+                        completed_cycles=self.cycles,
+                        cycle_frequency_cpm=round(self._frequency(), 2),
+                        final_auxiliary_status="not_configured",
+                    )
+                except Exception:
+                    pass
+                try:
+                    self.logger.close()
+                except Exception:
+                    pass
+                if not CsvLogger.read_live_runs(logger_folder):
+                    try:
+                        self.paths.delete_run_directory(logger_folder)
+                    except (OSError, ValueError):
+                        pass
+                self.destroy()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,14 @@ The source ZIP is for development rather than ordinary operation. Install Python
 
 If you used `setup_windows.bat`, run `.venv\Scripts\python.exe test_stand_app.py` instead.
 
+Before a hardware test or release build, run the hardware-free safety checks:
+
+```powershell
+python -m unittest -v test_core.py
+```
+
+They verify local-data safeguards and archive integrity without opening the LabJack.
+
 ## Local data and team sharing
 
 The GitHub project folder contains source code and documentation only. Each Windows computer stores its test-stand runtime data in:
@@ -45,7 +53,7 @@ Calibration and cycle stops are specific to the physical test stand, so they are
 
 A **live run** begins when you press **Start Counting** and ends when you press **Stop**, Reset while counting, a LabJack disconnect, or application close. Use **File → Configure Auto-Archive…** to choose an existing destination folder, included data types, and archive interval (15 minutes, 30 minutes, 1 hour, or 2 hours). Once configured, the application writes a timestamped, verified ZIP after each selected interval of active test time; paused time does not count. Stop, Reset, disconnect, and application close each write a final ZIP for the remaining partial segment.
 
-Each automatic ZIP is first written to a temporary file and integrity-checked. Only after that succeeds is the corresponding local staging session removed. If the destination becomes unavailable or ZIP creation fails, nothing is discarded: the application records the failure and keeps the local data available for recovery.
+Each automatic ZIP is first written to a temporary file and integrity-checked. Only after that succeeds is its local segment eligible for removal. If an older live run shares that staging session, the folder is retained and only the archived run is marked exported; this prevents one archive from deleting unrelated local data. If the destination becomes unavailable or ZIP creation fails, nothing is discarded: the application records the failure and keeps the local data available for recovery.
 
 **File → Export Runs…** remains available as a manual recovery/export tool. It lets an operator select one or more retained live runs and create a portable ZIP. Both automatic and manual archives can include:
 
