@@ -36,7 +36,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.20"
+APP_VERSION = "0.3.21"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -1807,8 +1807,8 @@ class TestStandApp(tk.Tk):
         self.chart_holder.grid(row=1, column=0, sticky="nsew", padx=(0, 10), pady=(14, 0))
         self.chart_holder.columnconfigure(0, weight=1)
         self.chart_holder.columnconfigure(1, weight=1)
-        self.chart_holder.rowconfigure(1, weight=3)
-        self.chart_holder.rowconfigure(2, weight=2)
+        self.chart_holder.rowconfigure(1, weight=1)
+        self.chart_holder.rowconfigure(2, weight=1)
         chart_toolbar = ttk.Frame(self.chart_holder)
         chart_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         ttk.Label(chart_toolbar, textvariable=self.graph_window_var, foreground="#64748b").pack(side="left")
@@ -1847,16 +1847,32 @@ class TestStandApp(tk.Tk):
             5000.0,
             "#d97706",
         )
-        self.pressure_plot.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        self.pressure_plot.grid(row=2, column=0, sticky="nsew", padx=(0, 5))
         self.pressure_plot.set_reference_lines([
             (INJECTOR_ACTIVATION_PSI, "#7c3aed", "Injector activation"),
         ])
         self._update_graph_pan_controls()
 
+        status_box = ttk.LabelFrame(self.chart_holder, text="Recent Events", padding=10)
+        status_box.grid(row=2, column=1, sticky="nsew", padx=(5, 0))
+        event_toolbar = ttk.Frame(status_box)
+        event_toolbar.pack(fill="x", pady=(0, 6))
+        ttk.Label(event_toolbar, text="Latest application activity", foreground="#475569").pack(side="left")
+        ttk.Button(
+            event_toolbar,
+            text="⛶",
+            width=3,
+            style="Icon.TButton",
+            command=self.open_event_terminal,
+        ).pack(side="right")
+        self.event_log = ScrolledText(status_box, height=9, wrap="word", state="disabled",
+                                      font=("Consolas", 9), background="#f8fafc", foreground="#1e293b",
+                                      relief="flat")
+        self.event_log.pack(fill="both", expand=True)
+
         sidebar = ttk.Frame(main)
         sidebar.grid(row=1, column=1, sticky="nsew", pady=(14, 0))
         sidebar.columnconfigure(0, weight=1)
-        sidebar.rowconfigure(2, weight=1)
 
         controls = ttk.LabelFrame(sidebar, text="Test Controls", padding=12)
         controls.grid(row=0, column=0, sticky="ew")
@@ -1901,23 +1917,6 @@ class TestStandApp(tk.Tk):
             auxiliary, 1, 1, "Temperature 2", "temp_2", "— °F", "Input not configured",
             expand_command=lambda: self.open_temperature_history_window(2),
         )
-
-        status_box = ttk.LabelFrame(sidebar, text="Recent Events", padding=10)
-        status_box.grid(row=2, column=0, sticky="nsew")
-        event_toolbar = ttk.Frame(status_box)
-        event_toolbar.pack(fill="x", pady=(0, 6))
-        ttk.Label(event_toolbar, text="Latest application activity", foreground="#475569").pack(side="left")
-        ttk.Button(
-            event_toolbar,
-            text="⛶",
-            width=3,
-            style="Icon.TButton",
-            command=self.open_event_terminal,
-        ).pack(side="right")
-        self.event_log = ScrolledText(status_box, height=9, wrap="word", state="disabled",
-                                      font=("Consolas", 9), background="#f8fafc", foreground="#1e293b",
-                                      relief="flat")
-        self.event_log.pack(fill="both", expand=True)
 
     def _metric(
         self,
