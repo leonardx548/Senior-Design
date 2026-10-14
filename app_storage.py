@@ -111,8 +111,10 @@ class CsvLogger:
         self.manifest_path = folder / "run_manifest.json"
         self.live_runs_path = folder / LIVE_RUNS_FILENAME
         self.cycle_file = (folder / "cycle_summary.csv").open("w", newline="", encoding="utf-8")
+        self.grease_file = (folder / "grease_events.csv").open("w", newline="", encoding="utf-8")
         self.event_file = (folder / "events.csv").open("w", newline="", encoding="utf-8")
         self.cycles = csv.writer(self.cycle_file)
+        self.grease_events = csv.writer(self.grease_file)
         self.events = csv.writer(self.event_file)
         self.cycles.writerow(
             [
@@ -132,9 +134,7 @@ class CsvLogger:
                 "bushing_peak_signed_velocity_degrees_per_second",
                 "bushing_median_travel_velocity_degrees_per_second",
                 "bushing_velocity_sample_count",
-                "grease_peak_pressure_psi",
-                "grease_pressure_response_time_seconds",
-                "grease_pressure_peak_time_seconds",
+                "grease_event_ids",
                 "temperature_1_f",
                 "temperature_2_f",
                 "temperature_3_f",
@@ -143,11 +143,37 @@ class CsvLogger:
                 "bushing_data_quality",
             ]
         )
+        self.grease_events.writerow(
+            [
+                "grease_event_id",
+                "live_run_id",
+                "injection_started_at",
+                "injection_cycle_number",
+                "injection_cycle_phase",
+                "commanded_pulse_seconds",
+                "pre_injection_cycle_count",
+                "pre_median_travel_velocity_degrees_per_second",
+                "pre_median_reset_to_count_duration_seconds",
+                "post_injection_cycle_count",
+                "post_median_travel_velocity_degrees_per_second",
+                "post_median_reset_to_count_duration_seconds",
+                "median_travel_velocity_change_percent",
+                "reset_to_count_duration_change_percent",
+                "pressure_baseline_psi",
+                "pressure_peak_psi",
+                "pressure_peak_at",
+                "pressure_time_to_2500_psi_seconds",
+                "pressure_response_window_seconds",
+                "pressure_sample_count",
+                "analysis_status",
+            ]
+        )
         self.events.writerow(["timestamp", "live_run_id", "event", "detail", "completed_cycles"])
         self.cycle_file.flush()
+        self.grease_file.flush()
         self.event_file.flush()
         self._write_manifest({
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": folder.name,
             "status": "active",
             "started_at": self.started_at.isoformat(timespec="seconds"),
@@ -169,7 +195,7 @@ class CsvLogger:
         try:
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
-            manifest = {"schema_version": 1, "run_id": self.folder.name}
+            manifest = {"schema_version": 2, "run_id": self.folder.name}
         manifest.update(values)
         self._write_manifest(manifest)
 
@@ -206,7 +232,7 @@ class CsvLogger:
         """Create a logical test run within this always-recording app session."""
         runs = self._live_runs()
         run = {
-            "schema_version": 1,
+            "schema_version": 2,
             "id": f"run_{len(runs) + 1:03d}",
             "status": "active",
             "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -257,6 +283,7 @@ class CsvLogger:
 
     def flush(self) -> None:
         self.cycle_file.flush()
+        self.grease_file.flush()
         self.event_file.flush()
 
     def finalize(self, **values: Any) -> None:
@@ -292,9 +319,7 @@ class CsvLogger:
                 values["bushing_peak_signed_velocity"],
                 values["bushing_median_travel_velocity"],
                 values["bushing_velocity_sample_count"],
-                values["grease_peak_pressure"],
-                values["grease_pressure_response_time"],
-                values["grease_pressure_peak_time"],
+                values["grease_event_ids"],
                 values["temp_1"],
                 values["temp_2"],
                 values["temp_3"],
@@ -309,7 +334,37 @@ class CsvLogger:
         self.events.writerow([self.timestamp(), live_run_id or "", event, detail, cycles])
         self.event_file.flush()
 
+    def log_grease_event(self, values: dict[str, float | int | str], live_run_id: str) -> None:
+        """Write one injection record with its associated pre/post cycle comparison."""
+        self.grease_events.writerow(
+            [
+                values["grease_event_id"],
+                live_run_id,
+                values["injection_started_at"],
+                values["injection_cycle_number"],
+                values["injection_cycle_phase"],
+                values["commanded_pulse_seconds"],
+                values["pre_injection_cycle_count"],
+                values["pre_median_travel_velocity"],
+                values["pre_median_reset_to_count_duration"],
+                values["post_injection_cycle_count"],
+                values["post_median_travel_velocity"],
+                values["post_median_reset_to_count_duration"],
+                values["median_travel_velocity_change_percent"],
+                values["reset_to_count_duration_change_percent"],
+                values["pressure_baseline"],
+                values["pressure_peak"],
+                values["pressure_peak_at"],
+                values["pressure_time_to_threshold"],
+                values["pressure_response_window_seconds"],
+                values["pressure_sample_count"],
+                values["analysis_status"],
+            ]
+        )
+        self.grease_file.flush()
+
     def close(self) -> None:
         self.flush()
         self.cycle_file.close()
+        self.grease_file.close()
         self.event_file.close()

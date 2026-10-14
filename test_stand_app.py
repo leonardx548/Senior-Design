@@ -32,9 +32,11 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
+GREASE_COMPARISON_CYCLE_COUNT = 3
+GREASE_PRESSURE_RESPONSE_WINDOW_SECONDS = 10.0
 AUTO_ARCHIVE_INTERVAL_SECONDS = 60 * 60
 AUTO_ARCHIVE_CONFIG_FILENAME = "auto_archive.json"
 VELOCITY_SLOPE_WINDOW_SAMPLES = 11
@@ -49,6 +51,7 @@ GITHUB_RELEASES_URL = "https://github.com/leonardx548/Senior-Design/releases/lat
 
 EXPORT_FILE_OPTIONS = (
     ("cycles", "Cycle summary", "cycle_summary.csv"),
+    ("grease", "Grease events", "grease_events.csv"),
     ("events", "Event log", "events.csv"),
     ("metadata", "Run metadata", "live_run.json"),
     ("configuration", "Run configuration", "run_configuration.json"),
@@ -72,6 +75,7 @@ class CycleCapture:
     peak_velocity: float | None = None
     peak_signed_velocity: float | None = None
     mid_stroke_velocities: list[float] = field(default_factory=list)
+    grease_event_ids: list[str] = field(default_factory=list)
 
     def observe(self, angle: float, velocity: float | None, sample_at: str, sample_monotonic: float) -> None:
         if velocity is not None and (self.peak_velocity is None or abs(velocity) > self.peak_velocity):
@@ -130,16 +134,89 @@ class CycleCapture:
                 "" if not self.mid_stroke_velocities else round(statistics.median(self.mid_stroke_velocities), 4)
             ),
             "bushing_velocity_sample_count": len(self.mid_stroke_velocities),
-            # These are deliberately blank until physical pressure and temperature inputs exist.
-            "grease_peak_pressure": "",
-            "grease_pressure_response_time": "",
-            "grease_pressure_peak_time": "",
+            "grease_event_ids": ";".join(self.grease_event_ids),
+            # These are deliberately blank until physical temperature inputs exist.
             "temp_1": "",
             "temp_2": "",
             "temp_3": "",
             "temp_4": "",
             "frequency": round(frequency, 4),
             "bushing_data_quality": "; ".join(quality) if quality else "complete",
+        }
+
+
+@dataclass
+class GreaseEventCapture:
+    """One real injection and the nearby cycles used to measure its performance effect."""
+
+    event_id: str
+    started_at: str
+    started_monotonic: float
+    injection_cycle_number: int
+    injection_cycle_phase: str
+    commanded_pulse_seconds: float | str
+    pressure_baseline: float | None
+    pre_cycles: tuple[dict[str, float | int | str], ...]
+    post_cycles: list[dict[str, float | int | str]] = field(default_factory=list)
+    pressure_peak: float | None = None
+    pressure_peak_at: str | None = None
+    pressure_time_to_threshold: float | None = None
+    pressure_sample_count: int = 0
+
+    @staticmethod
+    def _median(cycles: tuple[dict[str, float | int | str], ...] | list[dict[str, float | int | str]], key: str) -> float | str:
+        values: list[float] = []
+        for cycle in cycles:
+            try:
+                values.append(float(cycle[key]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return "" if not values else round(statistics.median(values), 4)
+
+    @staticmethod
+    def _percent_change(before: float | str, after: float | str) -> float | str:
+        if not isinstance(before, float) or not isinstance(after, float) or not before:
+            return ""
+        return round((after - before) / before * 100.0, 4)
+
+    def record_pressure(self, pressure_psi: float, sample_at: str, sample_monotonic: float) -> None:
+        if sample_monotonic - self.started_monotonic > GREASE_PRESSURE_RESPONSE_WINDOW_SECONDS:
+            return
+        self.pressure_sample_count += 1
+        if self.pressure_peak is None or pressure_psi > self.pressure_peak:
+            self.pressure_peak = pressure_psi
+            self.pressure_peak_at = sample_at
+        if self.pressure_time_to_threshold is None and pressure_psi >= INJECTOR_ACTIVATION_PSI:
+            self.pressure_time_to_threshold = round(sample_monotonic - self.started_monotonic, 4)
+
+    def values(self, *, status: str) -> dict[str, float | int | str]:
+        pre_velocity = self._median(self.pre_cycles, "bushing_median_travel_velocity")
+        post_velocity = self._median(self.post_cycles, "bushing_median_travel_velocity")
+        pre_duration = self._median(self.pre_cycles, "reset_to_count_duration_seconds")
+        post_duration = self._median(self.post_cycles, "reset_to_count_duration_seconds")
+        return {
+            "grease_event_id": self.event_id,
+            "injection_started_at": self.started_at,
+            "injection_cycle_number": self.injection_cycle_number,
+            "injection_cycle_phase": self.injection_cycle_phase,
+            "commanded_pulse_seconds": self.commanded_pulse_seconds,
+            "pre_injection_cycle_count": len(self.pre_cycles),
+            "pre_median_travel_velocity": pre_velocity,
+            "pre_median_reset_to_count_duration": pre_duration,
+            "post_injection_cycle_count": len(self.post_cycles),
+            "post_median_travel_velocity": post_velocity,
+            "post_median_reset_to_count_duration": post_duration,
+            "median_travel_velocity_change_percent": self._percent_change(pre_velocity, post_velocity),
+            "reset_to_count_duration_change_percent": self._percent_change(pre_duration, post_duration),
+            "pressure_baseline": "" if self.pressure_baseline is None else round(self.pressure_baseline, 4),
+            "pressure_peak": "" if self.pressure_peak is None else round(self.pressure_peak, 4),
+            "pressure_peak_at": self.pressure_peak_at or "",
+            "pressure_time_to_threshold": (
+                "" if self.pressure_time_to_threshold is None else self.pressure_time_to_threshold
+            ),
+            "pressure_response_window_seconds": GREASE_PRESSURE_RESPONSE_WINDOW_SECONDS,
+            "pressure_sample_count": self.pressure_sample_count,
+            "analysis_status": status,
         }
 
 
@@ -187,7 +264,7 @@ def write_live_run_archive(
         raise OSError(f"Archive folder is unavailable: {destination.parent}")
 
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_application": "Senior Design Test Stand",
         "selected_live_runs": [
@@ -209,7 +286,7 @@ def write_live_run_archive(
                 archive_folder = f"{folder.name}/{run_id}"
                 for key, _label, filename in options:
                     archive_filename = filename
-                    if key in {"cycles", "events"}:
+                    if key in {"cycles", "grease", "events"}:
                         contents = filtered_live_run_csv(folder, filename, run_id)
                         # Older local sessions used the retired snapshot log. Keep
                         # those records exportable without producing a mislabeled CSV.
@@ -1142,6 +1219,11 @@ class TestStandApp(tk.Tk):
         self.cycle_state = "waiting_for_retracted"
         self.cycle_times: deque[float] = deque()
         self._cycle_capture: CycleCapture | None = None
+        self._recent_cycle_summaries: deque[dict[str, float | int | str]] = deque(
+            maxlen=GREASE_COMPARISON_CYCLE_COUNT
+        )
+        self._pending_grease_events: list[GreaseEventCapture] = []
+        self._grease_event_sequence = 0
         self.position_calibration = self.load_position_calibration()
         self.cycle_stops = self.load_cycle_stops()
         self.ain2_monitor = LabJackAin2Monitor()
@@ -1432,7 +1514,7 @@ class TestStandApp(tk.Tk):
 
     def _run_configuration_values(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "app_version": APP_VERSION,
             "data_model": {
@@ -1450,6 +1532,7 @@ class TestStandApp(tk.Tk):
             "signals": {
                 "ain2_bushing_position": "LabJack T4 live read-only input",
                 "grease_pressure": "hardware input not configured",
+                "grease_event_analysis": "awaiting physical injector trigger integration",
                 "temperature_1_to_4": "hardware inputs not configured",
                 "physical_outputs": "not implemented",
             },
@@ -1609,11 +1692,13 @@ class TestStandApp(tk.Tk):
         live_run = self.logger.begin_live_run(self._run_configuration_values(), self.cycles)
         self.current_live_run_id = str(live_run["id"])
         self.current_live_run_cycle_start = int(live_run["completed_cycles_at_start"])
+        self._recent_cycle_summaries.clear()
 
     def _finish_live_run(self, status: str) -> None:
         if not self.current_live_run_id:
             return
         self._discard_cycle_capture("Live run ended before the count stop was reached.")
+        self._finalize_pending_grease_events("partial: live run ended before comparison window completed")
         self.cycle_state = "waiting_for_retracted"
         self.logger.finish_live_run(
             self.current_live_run_id,
@@ -1914,6 +1999,37 @@ class TestStandApp(tk.Tk):
             self.log_event("Partial cycle discarded", reason)
         self._cycle_capture = None
 
+    @staticmethod
+    def _grease_event_status(event: GreaseEventCapture, completion: str) -> str:
+        baseline_note = "" if len(event.pre_cycles) == GREASE_COMPARISON_CYCLE_COUNT else (
+            f"; limited pre-injection baseline ({len(event.pre_cycles)}/{GREASE_COMPARISON_CYCLE_COUNT} cycles)"
+        )
+        return completion + baseline_note
+
+    def _finalize_pending_grease_events(self, completion: str) -> None:
+        """Persist pending injection comparisons before the active live run closes."""
+        if not self.current_live_run_id:
+            return
+        for event in self._pending_grease_events:
+            status = self._grease_event_status(event, completion)
+            self.logger.log_grease_event(event.values(status=status), self.current_live_run_id)
+            self.log_event("Grease event saved", f"{event.event_id}: {status}.")
+        self._pending_grease_events.clear()
+
+    def _add_cycle_to_grease_comparisons(self, values: dict[str, float | int | str]) -> None:
+        self._recent_cycle_summaries.append(values)
+        completed: list[GreaseEventCapture] = []
+        for event in self._pending_grease_events:
+            event.post_cycles.append(values)
+            if len(event.post_cycles) >= GREASE_COMPARISON_CYCLE_COUNT:
+                completed.append(event)
+        for event in completed:
+            self._pending_grease_events.remove(event)
+            status = self._grease_event_status(event, "complete: 3 post-injection cycles")
+            if self.current_live_run_id:
+                self.logger.log_grease_event(event.values(status=status), self.current_live_run_id)
+            self.log_event("Grease event saved", f"{event.event_id}: {status}.")
+
     def _update_cycle_count_from_bushing(self, angle: float, sample_at: str, sample_monotonic: float) -> None:
         """Use direction-independent stop hysteresis to count real motion once per stroke."""
         if not self.is_running or not self.cycle_stops:
@@ -1945,6 +2061,7 @@ class TestStandApp(tk.Tk):
                 frequency=self._frequency(),
             )
             self.logger.log_cycle(values, self.current_live_run_id)
+            self._add_cycle_to_grease_comparisons(values)
             self._cycle_capture = None
         self.log_event(
             "Cycle detected",
@@ -2101,6 +2218,45 @@ class TestStandApp(tk.Tk):
             self.last_labjack_signature = signature
             self.log_event(event, event_detail)
 
+    def record_grease_injection(self, commanded_pulse_seconds: float | None = None) -> str | None:
+        """Register a real injector firing for later pre/post-cycle comparison.
+
+        A future physical output adapter must call this at the actual firing time.
+        It intentionally does not command hardware or create a synthetic event.
+        """
+        if not self.current_live_run_id:
+            return None
+        pulse: float | str = ""
+        if commanded_pulse_seconds is not None:
+            try:
+                candidate = float(commanded_pulse_seconds)
+                if candidate > 0:
+                    pulse = round(candidate, 4)
+            except (TypeError, ValueError):
+                pass
+        self._grease_event_sequence += 1
+        event_id = f"grease_{self._grease_event_sequence:03d}"
+        if self._cycle_capture is not None:
+            phase = "during reset-to-count stroke"
+            injection_cycle_number = self.cycles + 1
+            self._cycle_capture.grease_event_ids.append(event_id)
+        else:
+            phase = "between completed cycles"
+            injection_cycle_number = self.cycles
+        event = GreaseEventCapture(
+            event_id=event_id,
+            started_at=datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            started_monotonic=time.monotonic(),
+            injection_cycle_number=injection_cycle_number,
+            injection_cycle_phase=phase,
+            commanded_pulse_seconds=pulse,
+            pressure_baseline=self.grease_pressure,
+            pre_cycles=tuple(self._recent_cycle_summaries),
+        )
+        self._pending_grease_events.append(event)
+        self.log_event("Grease injection recorded", f"{event_id} registered for a {GREASE_COMPARISON_CYCLE_COUNT}-cycle comparison.")
+        return event_id
+
     def record_grease_pressure(self, pressure_psi: float) -> None:
         """Accept a real grease-pressure reading when that input is implemented.
 
@@ -2116,6 +2272,10 @@ class TestStandApp(tk.Tk):
         self.grease_pressure = value
         self.metric_vars["pressure"].set(f"{value:,.0f} psi")
         self.pressure_plot.add(value)
+        sample_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        sample_monotonic = time.monotonic()
+        for event in self._pending_grease_events:
+            event.record_pressure(value, sample_at, sample_monotonic)
 
     def tick(self) -> None:
         now = time.monotonic()

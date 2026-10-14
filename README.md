@@ -50,6 +50,7 @@ Each automatic ZIP is first written to a temporary file and integrity-checked. O
 **File → Export Runs…** remains available as a manual recovery/export tool. It lets an operator select one or more retained live runs and create a portable ZIP. Both automatic and manual archives can include:
 
 - `cycle_summary.csv` — one measured record for each completed reset-to-count stroke;
+- `grease_events.csv` — one real injector firing with its pressure response and nearby-cycle comparison;
 - `events.csv` — cycle detections, connection changes, and application events;
 - live-run metadata — start/end status, cycle totals, and whether it has been exported; and
 - `run_configuration.json` — the calibration, cycle stops, and measurement model captured when that live run started.
@@ -100,7 +101,8 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 - Live bushing-position and grease-pressure plots. The pressure plot stays empty until its hardware input is implemented and retains a 2,500 psi injector-activation reference line.
 - A compact Recent Events preview plus an **Expand…** button that opens a full-size, live-updating event terminal.
 - Per-run CSV output in `%LOCALAPPDATA%\SeniorDesignTestStand\logs\session_YYYYMMDD_HHMMSS\`:
-  - `cycle_summary.csv` records one row per completed reset-to-count stroke. It includes timing, configured stops, travel direction, peak and median bushing velocity, current CPM, four reserved temperature fields, three reserved grease-pressure-response fields, and a bushing-data-quality indicator.
+  - `cycle_summary.csv` records one row per completed reset-to-count stroke. It includes timing, configured stops, travel direction, peak and median bushing velocity, current CPM, four reserved temperature fields, any grease-event IDs that occurred during the stroke, and a bushing-data-quality indicator.
+  - `grease_events.csv` records each actual injector firing separately. It captures the injection timestamp and pulse duration, pressure baseline, peak pressure and time to the 2,500 psi threshold during the first 10 seconds, and medians from the three completed cycles immediately before and after the injection. It also stores the resulting velocity and stroke-duration percentage changes for straightforward Excel or AI analysis.
   - `events.csv` records cycle detections, connection changes, and program events, with the active live-run ID when applicable.
   - `live_runs.json` defines the Start-to-Stop export boundaries and preserves each run's starting configuration.
   - `run_manifest.json` and `run_configuration.json` describe the complete application session.
@@ -108,6 +110,7 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 ## Important limits
 
 - The AIN2 bushing-position reading and its derived cycle count are real, read-only T4 measurements. Grease pressure, solenoid commands, and all four temperature channels are not yet connected or implemented. Their dashboard cards stay visible and report "Input not configured" until that hardware work is completed.
+- `grease_events.csv` is ready for the future physical injector integration, but it does not create rows until that integration reports an actual firing. The application never invents grease events or pressure data.
 - The diagnostic utility only opens a read-only T4 connection to identify the device; it does not read auxiliary channels or control outputs.
 
 ## Preparing a GitHub Release
