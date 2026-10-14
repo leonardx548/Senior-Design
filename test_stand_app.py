@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.11"
+APP_VERSION = "0.3.12"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -1358,6 +1358,7 @@ class TestStandApp(tk.Tk):
         self._snapshot_samples: deque[PositionVelocitySnapshotSample] = deque(maxlen=SNAPSHOT_HISTORY_MAX_SAMPLES)
         self._snapshot_stream_gap_pending = False
         self._latest_snapshot_sample_monotonic: float | None = None
+        self._latest_display_sample_monotonic: float | None = None
         self.graphs_paused = False
         self._frozen_snapshot_samples: tuple[PositionVelocitySnapshotSample, ...] | None = None
         self._frozen_position_graph: dict[str, object] | None = None
@@ -2163,7 +2164,7 @@ class TestStandApp(tk.Tk):
                 "Live bushing velocity (°/s, calibrated AIN2)", -new_limit, new_limit, clear_samples=False
             )
             self.velocity_plot.set_reference_lines([(0.0, "#94a3b8", "Stationary")])
-        self.velocity_plot.add(self.bushing_velocity, self._latest_snapshot_sample_monotonic)
+        self.velocity_plot.add(self.bushing_velocity, self._latest_display_sample_monotonic)
 
     def _start_cycle_capture(self, retracted: float, extended: float, sample_at: str, sample_monotonic: float) -> None:
         self._cycle_capture = CycleCapture(
@@ -2310,6 +2311,10 @@ class TestStandApp(tk.Tk):
     ) -> None:
         """Feed each hardware-timed sample to the detector; never reject it for motion."""
         self._display_voltage_samples.append(voltage)
+        # The charts must advance with every valid AIN2 input, even if that
+        # input sits just outside the saved calibration range and is excluded
+        # from the snapshot data.
+        self._latest_display_sample_monotonic = sample_monotonic
         if self.position_calibration:
             angle, outside = self.angle_from_voltage(voltage, self.position_calibration)
             if not outside:
@@ -2335,7 +2340,7 @@ class TestStandApp(tk.Tk):
                 detail += " • OUT"
             self.bushing_detail_var.set(detail)
             if not self.graphs_paused:
-                self.bushing_plot.add(angle, self._latest_snapshot_sample_monotonic)
+                self.bushing_plot.add(angle, self._latest_display_sample_monotonic)
         else:
             self.bushing_position, self.bushing_unit = voltage, "volts"
             self.metric_vars["position"].set(f"{voltage:.4f} V")
