@@ -115,6 +115,18 @@ class CoreSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             app.record_temperature(3, 70.0)
 
+    def test_cycle_frequency_history_samples_once_per_second(self) -> None:
+        app = TestStandApp.__new__(TestStandApp)
+        app.cycle_frequency_history = []
+        app._frequency = lambda: 12.5
+        app.test_elapsed_seconds = 0.1
+        app._record_cycle_frequency_history()
+        app.test_elapsed_seconds = 0.9
+        app._record_cycle_frequency_history()
+        app.test_elapsed_seconds = 1.1
+        app._record_cycle_frequency_history()
+        self.assertEqual(app.cycle_frequency_history, [(0.1, 12.5), (1.1, 12.5)])
+
     def test_automatic_archive_retains_a_shared_session_folder(self) -> None:
         """Exporting one run must never delete earlier runs in its CSV folder."""
         paths = AppPaths.create(self.temporary_directory / "app_data")

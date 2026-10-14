@@ -36,7 +36,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.18"
+APP_VERSION = "0.3.19"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -1528,6 +1528,62 @@ class TemperatureHistoryDialog(tk.Toplevel):
         self.destroy()
 
 
+class CycleFrequencyHistoryDialog(tk.Toplevel):
+    """A one-second CPM trend across the full active test duration."""
+
+    def __init__(self, app: "TestStandApp") -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("Cycle Frequency History")
+        self.geometry("980x580")
+        self.minsize(700, 420)
+        self.configure(background="#f1f5f9")
+        self._refresh_after_id: str | None = None
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+        header = ttk.Frame(outer)
+        header.pack(fill="x", pady=(0, 8))
+        ttk.Label(header, text="Cycle frequency history", font=("Segoe UI", 14, "bold")).pack(side="left")
+        self.status_var = tk.StringVar()
+        ttk.Label(header, textvariable=self.status_var, foreground="#64748b").pack(side="left", padx=12)
+        self.plot = LivePlot(outer, "Cycle frequency (cpm)", 1.0, "#7c3aed", minimum=0.0)
+        self.plot.pack(fill="both", expand=True)
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        samples = tuple(self.app.cycle_frequency_history)
+        duration = max(60.0, self.app.test_elapsed_seconds)
+        maximum = max((value for _elapsed, value in samples), default=0.0)
+        self.plot.set_scale("Cycle frequency (cpm)", 0.0, max(1.0, maximum * 1.15), clear_samples=False)
+        if samples:
+            self.status_var.set(f"{len(samples):,} one-second readings  •  Test elapsed {self.app._format_test_time(self.app.test_elapsed_seconds)}")
+        else:
+            self.status_var.set("Start cycle counting to build the CPM history.")
+        self.plot.history_seconds = duration
+        self.plot.show_window(
+            samples,
+            window_end_monotonic=duration,
+            left_time_label="Test start",
+            right_time_label=self.app._format_test_time(self.app.test_elapsed_seconds),
+        )
+        self._refresh_after_id = self.after(1000, self._refresh)
+
+    def _close(self) -> None:
+        if self._refresh_after_id is not None:
+            self.after_cancel(self._refresh_after_id)
+            self._refresh_after_id = None
+        self.app.cycle_frequency_history_window = None
+        self.destroy()
+
+
 class TestStandApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1571,6 +1627,8 @@ class TestStandApp(tk.Tk):
         self.grease_pressure: float | None = None
         self.temperature_history: dict[int, list[tuple[float, float]]] = {1: [], 2: []}
         self.temperature_history_windows: dict[int, TemperatureHistoryDialog | None] = {1: None, 2: None}
+        self.cycle_frequency_history: list[tuple[float, float]] = []
+        self.cycle_frequency_history_window: CycleFrequencyHistoryDialog | None = None
         self.bushing_unit = "degrees" if self.position_calibration else "volts"
         self._display_voltage_samples: deque[float] = deque(maxlen=5)
         self._velocity_angles: deque[float] = deque(maxlen=VELOCITY_SLOPE_WINDOW_SAMPLES)
@@ -1620,6 +1678,7 @@ class TestStandApp(tk.Tk):
         style.configure("Subheader.TLabel", background="#0f172a", foreground="#cbd5e1",
                         font=("Segoe UI", 9))
         style.configure("Metric.TFrame", background="#ffffff", relief="solid", borderwidth=1)
+        style.configure("MetricHeader.TFrame", background="#ffffff", relief="flat", borderwidth=0)
         style.configure("MetricName.TLabel", background="#ffffff", foreground="#475569",
                         font=("Segoe UI", 10, "bold"))
         style.configure("MetricValue.TLabel", background="#ffffff", foreground="#0f172a",
@@ -1740,7 +1799,10 @@ class TestStandApp(tk.Tk):
         self._metric(self.metrics, 0, 0, "Completed Cycles", "cycles", "0", None)
         self._metric(self.metrics, 0, 1, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
         self._metric(self.metrics, 0, 2, "Bushing Velocity", "velocity", "— °/s", None)
-        self._metric(self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", None)
+        self._metric(
+            self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", None,
+            expand_command=self.open_cycle_frequency_history_window,
+        )
         self._metric(self.metrics, 0, 4, "Grease Pressure", "pressure", "— psi", "Input not configured")
         self._metric(self.metrics, 1, 0, "Test Time", "test_time", "00:00:00", None)
         self._metric(
@@ -1874,7 +1936,7 @@ class TestStandApp(tk.Tk):
         frame.grid(
             row=row, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0), pady=(0 if row == 0 else 5, 0)
         )
-        heading = ttk.Frame(frame, style="Metric.TFrame")
+        heading = ttk.Frame(frame, style="MetricHeader.TFrame")
         heading.pack(fill="x")
         ttk.Label(heading, text=label, style="MetricName.TLabel").pack(side="left")
         if expand_command is not None:
@@ -1927,6 +1989,16 @@ class TestStandApp(tk.Tk):
             return
         self.temperature_history_windows[sensor_number] = TemperatureHistoryDialog(self, sensor_number)
 
+    def open_cycle_frequency_history_window(self) -> None:
+        """Open the full-test CPM trend."""
+        existing = self.cycle_frequency_history_window
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_set()
+            return
+        self.cycle_frequency_history_window = CycleFrequencyHistoryDialog(self)
+
     def record_temperature(self, sensor_number: int, temperature_fahrenheit: float) -> None:
         """Accept a future physical temperature reading and extend its test-history plot."""
         if sensor_number not in self.temperature_history:
@@ -1944,6 +2016,13 @@ class TestStandApp(tk.Tk):
         else:
             history.append((elapsed, value))
         self.metric_vars[f"temp_{sensor_number}"].set(f"{value:.1f} °F")
+
+    def _record_cycle_frequency_history(self) -> None:
+        """Sample the rolling CPM once per active second for the long-term graph."""
+        elapsed = self.test_elapsed_seconds
+        if self.cycle_frequency_history and elapsed - self.cycle_frequency_history[-1][0] < 1.0:
+            return
+        self.cycle_frequency_history.append((elapsed, self._frequency()))
 
     def _run_configuration_values(self) -> dict[str, object]:
         return {
@@ -2292,6 +2371,7 @@ class TestStandApp(tk.Tk):
         self.test_elapsed_seconds = 0.0
         for history in self.temperature_history.values():
             history.clear()
+        self.cycle_frequency_history.clear()
         self.cycle_state = "waiting_for_retracted"
         self.metric_vars["cycles"].set("0")
         self.metric_vars["frequency"].set("0.0 cpm")
@@ -3088,6 +3168,7 @@ class TestStandApp(tk.Tk):
             self._update_live_bushing_position(now)
             if self.is_running:
                 self.test_elapsed_seconds += elapsed
+                self._record_cycle_frequency_history()
             if self.is_running and self.auto_archive_active:
                 self.auto_archive_elapsed_seconds += elapsed
                 interval_seconds = int(self.active_auto_archive_config["interval_seconds"])
