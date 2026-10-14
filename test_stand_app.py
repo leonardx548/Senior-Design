@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import csv
+import math
 import os
 import shutil
 import statistics
@@ -34,7 +35,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.16"
+APP_VERSION = "0.3.17"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -402,6 +403,21 @@ class LivePlot(tk.Canvas):
         self._time_labels = (left_time_label, right_time_label)
         self.redraw()
 
+    @staticmethod
+    def _render_samples(samples: tuple[tuple[float, float], ...], maximum_points: int) -> tuple[tuple[float, float], ...]:
+        """Reduce dense raw data while preserving the high and low value in each bucket."""
+        if len(samples) <= maximum_points:
+            return samples
+        bucket_count = max(1, maximum_points // 2)
+        bucket_size = max(1, math.ceil(len(samples) / bucket_count))
+        selected_indexes = {0, len(samples) - 1}
+        for start in range(0, len(samples), bucket_size):
+            stop = min(len(samples), start + bucket_size)
+            indexes = range(start, stop)
+            selected_indexes.add(min(indexes, key=lambda index: samples[index][1]))
+            selected_indexes.add(max(indexes, key=lambda index: samples[index][1]))
+        return tuple(samples[index] for index in sorted(selected_indexes))
+
     def _window_end_monotonic(self) -> float:
         return self._window_end_override if self._window_end_override is not None else (
             self.samples[-1][0] if self.samples else time.monotonic()
@@ -482,9 +498,10 @@ class LivePlot(tk.Canvas):
                 lines.append(
                     f'<line x1="{margin_left}" y1="{y:.2f}" x2="{width - margin_right}" y2="{y:.2f}" stroke="{reference_color}" stroke-width="2" stroke-dasharray="5 3"/>'
                 )
-        if len(samples) >= 2:
+        render_samples = LivePlot._render_samples(samples, max(200, int(chart_width * 2)))
+        if len(render_samples) >= 2:
             points = []
-            for sample_time, value in samples:
+            for sample_time, value in render_samples:
                 x = margin_left + chart_width * max(0.0, min(1.0, (sample_time - window_start) / history_seconds))
                 y = margin_top + chart_height * (1 - (value - minimum) / (maximum - minimum))
                 points.append(f"{x:.2f},{y:.2f}")
@@ -519,14 +536,17 @@ class LivePlot(tk.Canvas):
                 continue
             y = margin_top + chart_height * (1 - (value - self.minimum) / (self.maximum - self.minimum))
             self.create_line(margin_left, y, width - margin_right, y, fill=color, width=2, dash=(5, 3))
-        if len(self.samples) < 2:
+        render_samples = self._render_samples(tuple(self.samples), max(200, int(chart_width * 2)))
+        if len(render_samples) < 2:
             return
         points: list[float] = []
-        for sample_time, value in self.samples:
+        for sample_time, value in render_samples:
             x = margin_left + chart_width * max(0.0, min(1.0, (sample_time - window_start) / self.history_seconds))
             y = margin_top + chart_height * (1 - (value - self.minimum) / (self.maximum - self.minimum))
             points.extend([x, y])
-        self.create_line(*points, fill=self.color, width=2, smooth=True)
+        # Raw AIN2 data should be drawn as measured. Tk spline smoothing can
+        # invent loops/overshoot and becomes slow with a dense paused window.
+        self.create_line(*points, fill=self.color, width=2)
 
 
 class LabJackAin2Monitor:
@@ -1494,9 +1514,12 @@ class TestStandApp(tk.Tk):
         self._snapshot_stream_gap_pending = False
         self._latest_snapshot_sample_monotonic: float | None = None
         self._latest_display_sample_monotonic: float | None = None
+        self._last_ain2_sample_monotonic: float | None = None
         self.graphs_paused = False
         self._frozen_snapshot_samples: tuple[PositionVelocitySnapshotSample, ...] | None = None
         self._frozen_snapshot_window_samples: tuple[PositionVelocitySnapshotSample, ...] | None = None
+        self._frozen_live_position_samples: tuple[tuple[float, float], ...] | None = None
+        self._frozen_live_velocity_samples: tuple[tuple[float, float], ...] | None = None
         self._frozen_position_graph: dict[str, object] | None = None
         self._frozen_velocity_graph: dict[str, object] | None = None
         self.graph_pan_offset_seconds = 0.0
@@ -2484,8 +2507,19 @@ class TestStandApp(tk.Tk):
                 samples = result.get("samples", [])
                 if not isinstance(samples, list):
                     samples = []
-                batch_end_at = datetime.now().astimezone()
-                batch_end_monotonic = time.monotonic()
+                fallback_end_monotonic = time.monotonic()
+                try:
+                    batch_end_monotonic = float(result.get("batch_ended_monotonic", fallback_end_monotonic))
+                except (TypeError, ValueError):
+                    batch_end_monotonic = fallback_end_monotonic
+                try:
+                    batch_end_at = datetime.fromisoformat(str(result.get("batch_ended_at", "")))
+                except (TypeError, ValueError):
+                    batch_end_at = datetime.now().astimezone()
+                if self._last_ain2_sample_monotonic is not None and batch_end_monotonic <= self._last_ain2_sample_monotonic:
+                    # A restarted or stale helper must never make time run
+                    # backward in the review buffer.
+                    batch_end_monotonic = self._last_ain2_sample_monotonic + len(samples) / max(scan_rate_hz, 1.0)
                 for index, raw_voltage in enumerate(samples):
                     try:
                         voltage = float(raw_voltage)
@@ -2496,6 +2530,7 @@ class TestStandApp(tk.Tk):
                     sample_at = (batch_end_at - timedelta(seconds=seconds_before_end)).isoformat(timespec="milliseconds")
                     self._process_counting_voltage(voltage, scan_rate_hz, sample_at, sample_monotonic)
                     latest_voltage = voltage
+                    self._last_ain2_sample_monotonic = sample_monotonic
             elif result.get("status") == "disconnected":
                 self._set_labjack_connection_state(
                     "disconnected", str(result.get("error", "LabJack T4 is disconnected."))
@@ -2579,6 +2614,8 @@ class TestStandApp(tk.Tk):
         self.graphs_paused = False
         self._frozen_snapshot_samples = None
         self._frozen_snapshot_window_samples = None
+        self._frozen_live_position_samples = None
+        self._frozen_live_velocity_samples = None
         self._frozen_position_graph = None
         self._frozen_velocity_graph = None
         self.graph_pan_offset_seconds = 0.0
@@ -2626,11 +2663,18 @@ class TestStandApp(tk.Tk):
         left_offset = self.graph_pan_offset_seconds + SNAPSHOT_HISTORY_SECONDS
         left_label = self._format_before_pause(left_offset)
         right_label = self._format_before_pause(self.graph_pan_offset_seconds)
-        position_samples = tuple((sample.monotonic_seconds, sample.position_degrees) for sample in window_samples)
-        velocity_samples = tuple(
-            (sample.monotonic_seconds, 0.0 if sample.velocity_degrees_per_second is None else sample.velocity_degrees_per_second)
-            for sample in window_samples
-        )
+        if self.graph_pan_offset_seconds <= 0.05 and self._frozen_live_position_samples is not None:
+            # At the moment of pause, keep the exact chart that the operator
+            # was already viewing. Raw 200 Hz data is for the saved CSV and
+            # for intentional historical panning, not a surprise redraw.
+            position_samples = self._frozen_live_position_samples
+            velocity_samples = self._frozen_live_velocity_samples or ()
+        else:
+            position_samples = tuple((sample.monotonic_seconds, sample.position_degrees) for sample in window_samples)
+            velocity_samples = tuple(
+                (sample.monotonic_seconds, 0.0 if sample.velocity_degrees_per_second is None else sample.velocity_degrees_per_second)
+                for sample in window_samples
+            )
         self.bushing_plot.show_window(
             position_samples,
             window_end_monotonic=window_end,
@@ -2691,6 +2735,8 @@ class TestStandApp(tk.Tk):
             self._render_live_graph_window()
             self._frozen_snapshot_samples = None
             self._frozen_snapshot_window_samples = None
+            self._frozen_live_position_samples = None
+            self._frozen_live_velocity_samples = None
             self._frozen_position_graph = None
             self._frozen_velocity_graph = None
             self.graph_pan_offset_seconds = 0.0
@@ -2708,6 +2754,8 @@ class TestStandApp(tk.Tk):
             return
         self.graphs_paused = True
         self._frozen_snapshot_samples = tuple(self._snapshot_samples)
+        self._frozen_live_position_samples = tuple(self.bushing_plot.samples)
+        self._frozen_live_velocity_samples = tuple(self.velocity_plot.samples)
         self.graph_pan_offset_seconds = 0.0
         self._render_frozen_graph_window()
         self.pause_graphs_button.configure(text="Resume")

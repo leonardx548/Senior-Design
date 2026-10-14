@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Any
 
 
@@ -235,6 +236,12 @@ def stream_ain2() -> int:
                     break
                 samples = [float(value) for value in stream_data if float(value) != -9999.0]
                 skipped_samples = len(stream_data) - len(samples)
+                # The dashboard may briefly be busy drawing or opening a dialog.
+                # Stamp this batch here, beside eStreamRead, so a queued batch
+                # keeps its true position on the time axis instead of being
+                # squeezed into the instant that Tk later consumes it.
+                batch_ended_monotonic = time.monotonic()
+                batch_ended_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
                 result = {
                     "status": "success",
                     "samples": samples,
@@ -242,6 +249,8 @@ def stream_ain2() -> int:
                     "skipped_samples": skipped_samples,
                     "device_backlog": device_backlog,
                     "ljm_backlog": ljm_backlog,
+                    "batch_ended_monotonic": batch_ended_monotonic,
+                    "batch_ended_at": batch_ended_at,
                 }
                 print(json.dumps(result), flush=True)
                 last_status = "success"

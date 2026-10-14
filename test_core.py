@@ -15,6 +15,7 @@ from test_stand_app import (
     DEFAULT_AUTO_ARCHIVE_INCLUDE,
     EXPORT_FILE_OPTIONS,
     TestStandApp,
+    LivePlot,
     write_live_run_archive,
 )
 
@@ -84,6 +85,16 @@ class CoreSafetyTests(unittest.TestCase):
         unstable = summarize_ain2_samples([0.0, 0.2, 0.0, 0.2])
         self.assertEqual(stable["status"], "success")
         self.assertEqual(unstable["status"], "unstable")
+
+    def test_graph_reduction_preserves_time_order_and_extremes(self) -> None:
+        samples = tuple((float(index), float(index % 5)) for index in range(1000))
+        samples = samples[:501] + ((501.0, 99.0),) + samples[502:]
+        reduced = LivePlot._render_samples(samples, maximum_points=100)
+        self.assertLessEqual(len(reduced), 102)
+        self.assertEqual(reduced[0], samples[0])
+        self.assertEqual(reduced[-1], samples[-1])
+        self.assertIn((501.0, 99.0), reduced)
+        self.assertEqual(tuple(point[0] for point in reduced), tuple(sorted(point[0] for point in reduced)))
 
     def test_automatic_archive_retains_a_shared_session_folder(self) -> None:
         """Exporting one run must never delete earlier runs in its CSV folder."""
