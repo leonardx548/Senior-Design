@@ -1,6 +1,6 @@
 # Senior Design Test Stand
 
-This Windows desktop application uses the physical LabJack T4 read-only AIN2 signal for bushing position and cycle counting. The dashboard also reserves a grease-pressure channel and four temperature channels for future hardware inputs; it does not generate placeholder readings for them.
+This Windows desktop application uses the physical LabJack T4 read-only AIN2 signal for bushing position and cycle counting. The dashboard also reserves a grease-pressure channel and four temperature channels for future hardware inputs; it does not generate placeholder readings for them. The pressure chart includes a purple injector-activation reference line at 2,500 psi, ready for real pressure input.
 
 ## Quick start for teammates
 
@@ -91,7 +91,8 @@ Required dependencies are the official LabJack LJM Windows library/USB driver an
 - A readable operator dashboard with real AIN2 bushing position, real stop-based cycle detection, frequency, and reserved grease-pressure and temperature channels.
 - Directional cycle detection using two saved angular stops and hysteresis—not a timer counter.
 - Separate **Start Counting**, **Stop**, and **Reset** controls for cycle counting only. Start and Stop preserve the accumulated cycle total and its rolling CPM history; Reset clears both and re-arms the detector. None controls a pneumatic cylinder.
-- A clearly labeled event log and live bushing-position plot.
+- Live bushing-position and grease-pressure plots. The pressure plot stays empty until its hardware input is implemented and retains a 2,500 psi injector-activation reference line.
+- A compact Recent Events preview plus an **Expand…** button that opens a full-size, live-updating event terminal.
 - Per-run CSV output in `%LOCALAPPDATA%\SeniorDesignTestStand\logs\session_YYYYMMDD_HHMMSS\`:
   - `sensor_readings.csv` records timestamped readings at the configurable standard snapshot interval (one second by default), with the active live-run ID when applicable.
   - `events.csv` records cycle detections, connection changes, and program events, with the active live-run ID when applicable.

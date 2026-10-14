@@ -31,9 +31,10 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 DEFAULT_SENSOR_LOG_SECONDS = 1.0
 AIN2_POLL_SECONDS = 0.75
+INJECTOR_ACTIVATION_PSI = 2500.0
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
 MIN_CYCLE_STOP_SEPARATION_DEGREES = 1.0
 CALIBRATION_STREAM_SAMPLE_COUNT = 100
@@ -900,6 +901,50 @@ class LocalDataDialog(tk.Toplevel):
             messagebox.showinfo("Local data removed", f"Removed {len(selected)} local session(s).", parent=self)
 
 
+class EventTerminalDialog(tk.Toplevel):
+    """A full-size, read-only view of the operator event stream."""
+
+    def __init__(self, app: "TestStandApp") -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("Test Stand Event Terminal")
+        self.geometry("940x620")
+        self.minsize(680, 400)
+        self.configure(background="#f1f5f9")
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+        header = ttk.Frame(outer)
+        header.pack(fill="x", pady=(0, 8))
+        ttk.Label(header, text="Event Terminal", font=("Segoe UI", 14, "bold")).pack(side="left")
+        ttk.Label(
+            header,
+            text="Read-only live activity from this application session",
+            foreground="#475569",
+        ).pack(side="left", padx=12)
+        ttk.Button(header, text="Close", command=self.destroy).pack(side="right")
+        self.output = ScrolledText(
+            outer,
+            wrap="word",
+            state="disabled",
+            font=("Consolas", 10),
+            background="#f8fafc",
+            foreground="#1e293b",
+            relief="solid",
+            borderwidth=1,
+        )
+        self.output.pack(fill="both", expand=True)
+        self.append(app.event_log.get("1.0", "end-1c"))
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self.output.configure(state="normal")
+        self.output.insert("end", text)
+        self.output.configure(state="disabled")
+        self.output.see("end")
+
+
 class TestStandApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -925,10 +970,12 @@ class TestStandApp(tk.Tk):
         self.last_labjack_signature = ""
         self.ain2_voltage: float | None = None
         self.bushing_position: float | None = None
+        self.grease_pressure: float | None = None
         self.bushing_unit = "degrees" if self.position_calibration else "volts"
         self._display_voltage_samples: deque[float] = deque(maxlen=5)
         self.bushing_detail_var = tk.StringVar(value="Waiting for AIN2")
         self.cycle_stops_var = tk.StringVar(value=self.cycle_stops_summary())
+        self.event_terminal: EventTerminalDialog | None = None
 
         self._build_style()
         self._build_menu()
@@ -1121,14 +1168,29 @@ class TestStandApp(tk.Tk):
         self.chart_holder = ttk.Frame(main)
         self.chart_holder.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         self.chart_holder.columnconfigure(0, weight=1)
+        self.chart_holder.columnconfigure(1, weight=1)
         self.chart_holder.rowconfigure(0, weight=1)
         self.bushing_plot = LivePlot(self.chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
-        self.bushing_plot.grid(row=0, column=0, sticky="nsew")
+        self.bushing_plot.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         self.configure_bushing_plot(clear_samples=False)
+        self.pressure_plot = LivePlot(
+            self.chart_holder,
+            "Grease pressure (psi) — input not configured",
+            5000.0,
+            "#d97706",
+        )
+        self.pressure_plot.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        self.pressure_plot.set_reference_lines([
+            (INJECTOR_ACTIVATION_PSI, "#7c3aed", "Injector activation"),
+        ])
 
-        status_box = ttk.LabelFrame(main, text="Event Log", padding=12)
+        status_box = ttk.LabelFrame(main, text="Recent Events", padding=12)
         status_box.grid(row=2, column=1, sticky="nsew")
-        self.event_log = ScrolledText(status_box, height=14, wrap="word", state="disabled",
+        event_toolbar = ttk.Frame(status_box)
+        event_toolbar.pack(fill="x", pady=(0, 6))
+        ttk.Label(event_toolbar, text="Latest application activity", foreground="#475569").pack(side="left")
+        ttk.Button(event_toolbar, text="Expand…", command=self.open_event_terminal).pack(side="right")
+        self.event_log = ScrolledText(status_box, height=9, wrap="word", state="disabled",
                                       font=("Consolas", 9), background="#f8fafc", foreground="#1e293b",
                                       relief="flat")
         self.event_log.pack(fill="both", expand=True)
@@ -1153,10 +1215,22 @@ class TestStandApp(tk.Tk):
     def log_event(self, event: str, detail: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.logger.log_event(event, detail, self.cycles, live_run_id=self.current_live_run_id)
+        text = f"{timestamp}  {event}\n{detail}\n\n"
         self.event_log.configure(state="normal")
-        self.event_log.insert("end", f"{timestamp}  {event}\n{detail}\n\n")
+        self.event_log.insert("end", text)
         self.event_log.configure(state="disabled")
         self.event_log.see("end")
+        if self.event_terminal is not None and self.event_terminal.winfo_exists():
+            self.event_terminal.append(text)
+
+    def open_event_terminal(self) -> None:
+        """Open one full-size, live-updating event terminal for this session."""
+        if self.event_terminal is not None and self.event_terminal.winfo_exists():
+            self.event_terminal.deiconify()
+            self.event_terminal.lift()
+            self.event_terminal.focus_set()
+            return
+        self.event_terminal = EventTerminalDialog(self)
 
     def _run_configuration_values(self) -> dict[str, object]:
         return {
@@ -1550,15 +1624,31 @@ class TestStandApp(tk.Tk):
             "bushing_position": "" if self.bushing_position is None else f"{self.bushing_position:.4f}",
             "bushing_position_unit": self.bushing_unit if self.bushing_position is not None else "",
             "ain2_voltage": "" if self.ain2_voltage is None else f"{self.ain2_voltage:.5f}",
-            "pressure": "",
+            "pressure": "" if self.grease_pressure is None else self.grease_pressure,
             "temp_1": "",
             "temp_2": "",
             "temp_3": "",
             "temp_4": "",
             "cycles": self.cycles,
             "frequency": frequency,
-            "auxiliary_status": "not configured",
+            "auxiliary_status": "not configured" if self.grease_pressure is None else "partially active",
         }
+
+    def record_grease_pressure(self, pressure_psi: float) -> None:
+        """Accept a real grease-pressure reading when that input is implemented.
+
+        This intentionally has no generated-data caller. A future LabJack input
+        adapter can call it for each validated hardware sample.
+        """
+        try:
+            value = float(pressure_psi)
+        except (TypeError, ValueError):
+            return
+        if value < 0:
+            return
+        self.grease_pressure = value
+        self.metric_vars["pressure"].set(f"{value:,.0f} psi")
+        self.pressure_plot.add(value)
 
     def tick(self) -> None:
         now = time.monotonic()

@@ -31,7 +31,9 @@ Auxiliary channels
 The dashboard includes one grease-pressure card and four temperature cards so
 the hardware inputs have a defined operator display. Until those inputs are
 implemented, each card reports "Input not configured" rather than a fake
-reading.
+reading. The empty grease-pressure graph includes a 2,500 psi injector-
+activation reference line. Use Recent Events > Expand... for the full-size,
+live-updating event terminal.
 
 Each computer keeps its own calibration and run logs under:
 %LOCALAPPDATA%\SeniorDesignTestStand
