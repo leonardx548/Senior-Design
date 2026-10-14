@@ -33,14 +33,16 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.12"
+APP_VERSION = "0.3.13"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
 GREASE_PRESSURE_RESPONSE_WINDOW_SECONDS = 10.0
 SNAPSHOT_HISTORY_SECONDS = 15
+SNAPSHOT_REVIEW_SECONDS = 60
 SNAPSHOT_STREAM_RATE_HZ = 200
-SNAPSHOT_HISTORY_MAX_SAMPLES = SNAPSHOT_HISTORY_SECONDS * SNAPSHOT_STREAM_RATE_HZ
+SNAPSHOT_HISTORY_MAX_SAMPLES = SNAPSHOT_REVIEW_SECONDS * SNAPSHOT_STREAM_RATE_HZ
+SNAPSHOT_PAN_STEP_SECONDS = 5
 AUTO_ARCHIVE_INTERVAL_SECONDS = 60 * 60
 AUTO_ARCHIVE_INTERVAL_OPTIONS = (
     ("15 minutes", 15 * 60),
@@ -355,10 +357,14 @@ class LivePlot(tk.Canvas):
         self.samples: deque[tuple[float, float]] = deque()
         self.history_seconds = SNAPSHOT_HISTORY_SECONDS
         self.reference_lines: list[tuple[float, str, str]] = []
+        self._window_end_override: float | None = None
+        self._time_labels: tuple[str, str] | None = None
         self.bind("<Configure>", lambda _event: self.redraw())
 
     def add(self, value: float, sample_monotonic: float | None = None) -> None:
         sample_time = time.monotonic() if sample_monotonic is None else sample_monotonic
+        self._window_end_override = None
+        self._time_labels = None
         self.samples.append((sample_time, max(self.minimum, min(self.maximum, value))))
         while self.samples and self.samples[0][0] < sample_time - self.history_seconds:
             self.samples.popleft()
@@ -370,12 +376,38 @@ class LivePlot(tk.Canvas):
         self.maximum = maximum if maximum > minimum else minimum + 1.0
         if clear_samples:
             self.samples.clear()
+            self._window_end_override = None
+            self._time_labels = None
         self.redraw()
 
     def set_reference_lines(self, lines: list[tuple[float, str, str]]) -> None:
         """Draw labeled horizontal thresholds without affecting live samples."""
         self.reference_lines = lines
         self.redraw()
+
+    def show_window(
+        self,
+        samples: tuple[tuple[float, float], ...],
+        *,
+        window_end_monotonic: float,
+        left_time_label: str,
+        right_time_label: str,
+    ) -> None:
+        """Render an explicit, frozen time window without changing its scale."""
+        self.samples = deque(
+            (sample_time, max(self.minimum, min(self.maximum, value))) for sample_time, value in samples
+        )
+        self._window_end_override = window_end_monotonic
+        self._time_labels = (left_time_label, right_time_label)
+        self.redraw()
+
+    def _window_end_monotonic(self) -> float:
+        return self._window_end_override if self._window_end_override is not None else (
+            self.samples[-1][0] if self.samples else time.monotonic()
+        )
+
+    def _axis_time_labels(self) -> tuple[str, str]:
+        return self._time_labels or (f"{self.history_seconds:g}s ago", "now")
 
     def snapshot_state(self) -> dict[str, object]:
         """Capture the displayed graph state without depending on a screen capture tool."""
@@ -387,7 +419,9 @@ class LivePlot(tk.Canvas):
             "samples": tuple(self.samples),
             "reference_lines": tuple(self.reference_lines),
             "history_seconds": self.history_seconds,
-            "window_end_monotonic": self.samples[-1][0] if self.samples else time.monotonic(),
+            "window_end_monotonic": self._window_end_monotonic(),
+            "left_time_label": self._axis_time_labels()[0],
+            "right_time_label": self._axis_time_labels()[1],
             "width": max(self.winfo_width(), 600),
             "height": max(self.winfo_height(), 240),
         }
@@ -402,6 +436,8 @@ class LivePlot(tk.Canvas):
         reference_lines = tuple(state["reference_lines"])
         history_seconds = float(state["history_seconds"])
         window_end = float(state["window_end_monotonic"])
+        left_time_label = str(state.get("left_time_label", f"{history_seconds:g}s ago"))
+        right_time_label = str(state.get("right_time_label", "now"))
         window_start = window_end - history_seconds
         margin_left, margin_right, margin_top, margin_bottom = 42, 14, 28, 28
         chart_width = width - margin_left - margin_right
@@ -419,8 +455,8 @@ class LivePlot(tk.Canvas):
                 f'<text x="{margin_left - 5}" y="{y + 3:.2f}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">{value:,.1f}</text>',
             ))
         lines.extend((
-            f'<text x="{margin_left}" y="{height - 8}" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">{history_seconds:g}s ago</text>',
-            f'<text x="{width - margin_right}" y="{height - 8}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">now</text>',
+            f'<text x="{margin_left}" y="{height - 8}" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">{xml_escape(left_time_label)}</text>',
+            f'<text x="{width - margin_right}" y="{height - 8}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">{xml_escape(right_time_label)}</text>',
         ))
         for reference in reference_lines:
             value, reference_color = float(reference[0]), str(reference[1])
@@ -454,11 +490,12 @@ class LivePlot(tk.Canvas):
             value = self.minimum + (self.maximum - self.minimum) * fraction
             self.create_text(margin_left - 5, y, text=f"{value:,.1f}",
                              anchor="e", fill="#64748b", font=("Segoe UI", 8))
-        window_end = self.samples[-1][0] if self.samples else time.monotonic()
+        window_end = self._window_end_monotonic()
         window_start = window_end - self.history_seconds
-        self.create_text(margin_left, height - 9, text=f"{self.history_seconds:g}s ago", anchor="w", fill="#64748b",
+        left_time_label, right_time_label = self._axis_time_labels()
+        self.create_text(margin_left, height - 9, text=left_time_label, anchor="w", fill="#64748b",
                          font=("Segoe UI", 8))
-        self.create_text(width - margin_right, height - 9, text="now", anchor="e", fill="#64748b",
+        self.create_text(width - margin_right, height - 9, text=right_time_label, anchor="e", fill="#64748b",
                          font=("Segoe UI", 8))
         for value, color, _label in self.reference_lines:
             if not self.minimum <= value <= self.maximum:
@@ -1361,8 +1398,11 @@ class TestStandApp(tk.Tk):
         self._latest_display_sample_monotonic: float | None = None
         self.graphs_paused = False
         self._frozen_snapshot_samples: tuple[PositionVelocitySnapshotSample, ...] | None = None
+        self._frozen_snapshot_window_samples: tuple[PositionVelocitySnapshotSample, ...] | None = None
         self._frozen_position_graph: dict[str, object] | None = None
         self._frozen_velocity_graph: dict[str, object] | None = None
+        self.graph_pan_offset_seconds = 0.0
+        self.graph_window_var = tk.StringVar(value=f"Live: latest {SNAPSHOT_HISTORY_SECONDS:g} seconds")
         self.bushing_detail_var = tk.StringVar(value="Waiting for AIN2")
         self.velocity_detail_var = tk.StringVar(value="Calibrate AIN2 to calculate velocity")
         self.cycle_stops_var = tk.StringVar(value=self.cycle_stops_summary())
@@ -1563,6 +1603,15 @@ class TestStandApp(tk.Tk):
         chart_toolbar = ttk.Frame(self.chart_holder)
         chart_toolbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
         ttk.Label(chart_toolbar, text="Position and velocity", foreground="#475569").pack(side="left")
+        ttk.Label(chart_toolbar, textvariable=self.graph_window_var, foreground="#64748b").pack(side="left", padx=(12, 0))
+        self.pan_left_graph_button = ttk.Button(
+            chart_toolbar, text="◀", width=3, style="Icon.TButton", command=lambda: self.pan_paused_graphs(SNAPSHOT_PAN_STEP_SECONDS)
+        )
+        self.pan_left_graph_button.pack(side="left", padx=(12, 3))
+        self.pan_right_graph_button = ttk.Button(
+            chart_toolbar, text="▶", width=3, style="Icon.TButton", command=lambda: self.pan_paused_graphs(-SNAPSHOT_PAN_STEP_SECONDS)
+        )
+        self.pan_right_graph_button.pack(side="left")
         self.pause_graphs_button = ttk.Button(chart_toolbar, text="Pause", command=self.toggle_graph_pause)
         self.pause_graphs_button.pack(side="right")
         self.save_snapshot_button = ttk.Button(
@@ -1591,6 +1640,7 @@ class TestStandApp(tk.Tk):
         self.pressure_plot.set_reference_lines([
             (INJECTOR_ACTIVATION_PSI, "#7c3aed", "Injector activation"),
         ])
+        self._update_graph_pan_controls()
 
         status_box = ttk.LabelFrame(main, text="Recent Events", padding=12)
         status_box.grid(row=2, column=1, sticky="nsew")
@@ -2377,21 +2427,126 @@ class TestStandApp(tk.Tk):
         self._latest_snapshot_sample_monotonic = None
         self.graphs_paused = False
         self._frozen_snapshot_samples = None
+        self._frozen_snapshot_window_samples = None
         self._frozen_position_graph = None
         self._frozen_velocity_graph = None
+        self.graph_pan_offset_seconds = 0.0
+        self.graph_window_var.set(f"Live: latest {SNAPSHOT_HISTORY_SECONDS:g} seconds")
         if hasattr(self, "pause_graphs_button"):
             self.pause_graphs_button.configure(text="Pause")
             self.save_snapshot_button.configure(state="disabled")
+            self._update_graph_pan_controls()
+
+    @staticmethod
+    def _format_before_pause(seconds: float) -> str:
+        return "paused" if seconds <= 0.05 else f"{seconds:.0f}s before pause"
+
+    def _maximum_graph_pan_seconds(self) -> float:
+        if not self._frozen_snapshot_samples:
+            return 0.0
+        duration = self._frozen_snapshot_samples[-1].monotonic_seconds - self._frozen_snapshot_samples[0].monotonic_seconds
+        return max(0.0, duration - SNAPSHOT_HISTORY_SECONDS)
+
+    def _update_graph_pan_controls(self) -> None:
+        if not hasattr(self, "pan_left_graph_button"):
+            return
+        maximum = self._maximum_graph_pan_seconds()
+        self.pan_left_graph_button.configure(
+            state="normal" if self.graphs_paused and self.graph_pan_offset_seconds < maximum - 0.05 else "disabled"
+        )
+        self.pan_right_graph_button.configure(
+            state="normal" if self.graphs_paused and self.graph_pan_offset_seconds > 0.05 else "disabled"
+        )
+
+    def _render_frozen_graph_window(self) -> None:
+        """Render the selected 15-second portion of the paused review buffer."""
+        if not self._frozen_snapshot_samples:
+            return
+        history = self._frozen_snapshot_samples
+        newest = history[-1].monotonic_seconds
+        maximum_offset = self._maximum_graph_pan_seconds()
+        self.graph_pan_offset_seconds = max(0.0, min(self.graph_pan_offset_seconds, maximum_offset))
+        window_end = newest - self.graph_pan_offset_seconds
+        window_start = window_end - SNAPSHOT_HISTORY_SECONDS
+        window_samples = tuple(sample for sample in history if window_start <= sample.monotonic_seconds <= window_end)
+        if not window_samples:
+            return
+
+        left_offset = self.graph_pan_offset_seconds + SNAPSHOT_HISTORY_SECONDS
+        left_label = self._format_before_pause(left_offset)
+        right_label = self._format_before_pause(self.graph_pan_offset_seconds)
+        position_samples = tuple((sample.monotonic_seconds, sample.position_degrees) for sample in window_samples)
+        velocity_samples = tuple(
+            (sample.monotonic_seconds, 0.0 if sample.velocity_degrees_per_second is None else sample.velocity_degrees_per_second)
+            for sample in window_samples
+        )
+        self.bushing_plot.show_window(
+            position_samples,
+            window_end_monotonic=window_end,
+            left_time_label=left_label,
+            right_time_label=right_label,
+        )
+        self.velocity_plot.show_window(
+            velocity_samples,
+            window_end_monotonic=window_end,
+            left_time_label=left_label,
+            right_time_label=right_label,
+        )
+        self._frozen_snapshot_window_samples = window_samples
+        self._frozen_position_graph = self.bushing_plot.snapshot_state()
+        self._frozen_velocity_graph = self.velocity_plot.snapshot_state()
+        self.graph_window_var.set(f"Paused: {left_label} to {right_label}")
+        self._update_graph_pan_controls()
+
+    def _render_live_graph_window(self) -> None:
+        """Return both charts to the newest display-sized window after Resume."""
+        if not self._snapshot_samples:
+            return
+        history = tuple(self._snapshot_samples)
+        newest = history[-1].monotonic_seconds
+        window_start = newest - SNAPSHOT_HISTORY_SECONDS
+        window_samples = tuple(sample for sample in history if sample.monotonic_seconds >= window_start)
+        if not window_samples:
+            return
+        position_samples = tuple((sample.monotonic_seconds, sample.position_degrees) for sample in window_samples)
+        velocity_samples = tuple(
+            (sample.monotonic_seconds, 0.0 if sample.velocity_degrees_per_second is None else sample.velocity_degrees_per_second)
+            for sample in window_samples
+        )
+        self.bushing_plot.show_window(
+            position_samples,
+            window_end_monotonic=newest,
+            left_time_label=f"{SNAPSHOT_HISTORY_SECONDS:g}s ago",
+            right_time_label="now",
+        )
+        self.velocity_plot.show_window(
+            velocity_samples,
+            window_end_monotonic=newest,
+            left_time_label=f"{SNAPSHOT_HISTORY_SECONDS:g}s ago",
+            right_time_label="now",
+        )
+
+    def pan_paused_graphs(self, seconds: float) -> None:
+        """Move the paused 15-second view through its 60-second review buffer."""
+        if not self.graphs_paused:
+            return
+        self.graph_pan_offset_seconds += seconds
+        self._render_frozen_graph_window()
 
     def toggle_graph_pause(self) -> None:
-        """Freeze only the two bushing charts and a matching high-rate data window."""
+        """Freeze charts for review while hardware sampling continues in the background."""
         if self.graphs_paused:
             self.graphs_paused = False
+            self._render_live_graph_window()
             self._frozen_snapshot_samples = None
+            self._frozen_snapshot_window_samples = None
             self._frozen_position_graph = None
             self._frozen_velocity_graph = None
+            self.graph_pan_offset_seconds = 0.0
+            self.graph_window_var.set(f"Live: latest {SNAPSHOT_HISTORY_SECONDS:g} seconds")
             self.pause_graphs_button.configure(text="Pause")
             self.save_snapshot_button.configure(state="disabled")
+            self._update_graph_pan_controls()
             return
         if not self._snapshot_samples:
             messagebox.showinfo(
@@ -2402,13 +2557,13 @@ class TestStandApp(tk.Tk):
             return
         self.graphs_paused = True
         self._frozen_snapshot_samples = tuple(self._snapshot_samples)
-        self._frozen_position_graph = self.bushing_plot.snapshot_state()
-        self._frozen_velocity_graph = self.velocity_plot.snapshot_state()
+        self.graph_pan_offset_seconds = 0.0
+        self._render_frozen_graph_window()
         self.pause_graphs_button.configure(text="Resume")
         self.save_snapshot_button.configure(state="normal")
         self.log_event(
             "Graph snapshot paused",
-            f"Frozen {len(self._frozen_snapshot_samples):,} calibrated AIN2 samples for review or export.",
+            f"Frozen {len(self._frozen_snapshot_samples):,} calibrated AIN2 samples for review.",
         )
 
     def _snapshot_output_root(self) -> Path:
@@ -2424,8 +2579,8 @@ class TestStandApp(tk.Tk):
         return self.paths.root / "snapshots"
 
     def save_graph_snapshot(self) -> None:
-        """Export the paused full-rate capture and the two frozen graphs as a self-contained folder."""
-        samples = self._frozen_snapshot_samples
+        """Export the displayed paused window and its matching full-rate samples."""
+        samples = self._frozen_snapshot_window_samples
         position_graph, velocity_graph = self._frozen_position_graph, self._frozen_velocity_graph
         if not self.graphs_paused or not samples or position_graph is None or velocity_graph is None:
             return
@@ -2470,7 +2625,9 @@ class TestStandApp(tk.Tk):
                 "source": "paused position and velocity dashboard graphs",
                 "sample_count": len(samples),
                 "capture_duration_seconds": round(samples[-1].monotonic_seconds - first_time, 4),
-                "configured_history_seconds": SNAPSHOT_HISTORY_SECONDS,
+                "display_window_seconds": SNAPSHOT_HISTORY_SECONDS,
+                "review_buffer_seconds": SNAPSHOT_REVIEW_SECONDS,
+                "view_offset_before_pause_seconds": round(self.graph_pan_offset_seconds, 3),
                 "current_live_run_id": self.current_live_run_id,
                 "position_calibration": self.position_calibration,
                 "cycle_stops": self.cycle_stops,

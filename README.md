@@ -57,13 +57,13 @@ Each automatic ZIP is first written to a temporary file and integrity-checked. O
 
 The ZIP always contains a small `export_manifest.json` and keeps every selected live run inside its own folder. This makes multi-run exports safe to unzip without one run's `events.csv` overwriting another's. Automatic archives clear only their successfully archived local segment; manual exports retain local files. If automatic archiving is not configured, Reset offers the existing manual-export prompt before clearing the dashboard totals.
 
-The application does not create a periodic dashboard-snapshot log or retain raw AIN2 samples. It uses the 200 Hz AIN2 stream while each stroke is underway, then writes only its completed-cycle metrics. This keeps long tests compact while preserving the measurements used for comparison.
+The application does not create a periodic dashboard-snapshot log or retain raw AIN2 samples long-term. It keeps only the bounded 60-second in-memory review buffer, then writes completed-cycle metrics for routine logs. This keeps long tests compact while preserving the measurements used for comparison.
 
 ## Position and velocity graph snapshots
 
-The **Pause** button above the position and velocity charts freezes only those two chart displays, so an operator can inspect an event without interrupting the LabJack stream, cycle counting, velocity calculation, or normal run logging. It simultaneously freezes a rolling window of up to two minutes of calibrated AIN2 data at the hardware stream rate (normally 200 Hz). **Resume** returns the charts to the live view and discards that frozen copy.
+The **Pause** button above the position and velocity charts freezes only those two chart displays, so an operator can inspect an event without interrupting the LabJack stream, cycle counting, velocity calculation, or normal run logging. It freezes the latest 60 seconds of calibrated AIN2 data at the hardware stream rate (normally 200 Hz). The charts show a 15-second window; use the left/right arrows to inspect older or newer portions of that frozen buffer. Each graph’s time labels update relative to the pause point. **Resume** returns the charts to the live view and discards that frozen copy.
 
-While paused, **Save Snapshot…** writes a timestamped folder. If an automatic archive/output folder is configured, it is created under `snapshots` in that folder; otherwise it is created under `%LOCALAPPDATA%\SeniorDesignTestStand\snapshots`. Each folder contains:
+While paused, **Save Snapshot…** writes the currently displayed 15-second window to a timestamped folder. If an automatic archive/output folder is configured, it is created under `snapshots` in that folder; otherwise it is created under `%LOCALAPPDATA%\SeniorDesignTestStand\snapshots`. Each folder contains:
 
 - `position_velocity_200hz.csv` — timestamp, elapsed time, stream rate, raw AIN2 voltage, calibrated bushing angle, derived velocity, and stream-gap markers;
 - `position_graph.svg` and `velocity_graph.svg` — static copies of the paused chart displays; and
