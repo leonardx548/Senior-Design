@@ -43,7 +43,7 @@ Calibration and cycle stops are specific to the physical test stand, so they are
 
 ## Automatic archives, exporting, and local data
 
-A **live run** begins when you press **Start Counting** and ends when you press **Stop**, Reset while counting, a LabJack disconnect, or application close. Use **File → Configure Auto-Archive…** to choose an existing destination folder and the data types included in each archive. Once configured, the application writes a timestamped, verified ZIP after every hour of active test time; paused time does not count. Stop, Reset, disconnect, and application close each write a final ZIP for the remaining partial segment.
+A **live run** begins when you press **Start Counting** and ends when you press **Stop**, Reset while counting, a LabJack disconnect, or application close. Use **File → Configure Auto-Archive…** to choose an existing destination folder, included data types, and archive interval (15 minutes, 30 minutes, 1 hour, or 2 hours). Once configured, the application writes a timestamped, verified ZIP after each selected interval of active test time; paused time does not count. Stop, Reset, disconnect, and application close each write a final ZIP for the remaining partial segment.
 
 Each automatic ZIP is first written to a temporary file and integrity-checked. Only after that succeeds is the corresponding local staging session removed. If the destination becomes unavailable or ZIP creation fails, nothing is discarded: the application records the failure and keeps the local data available for recovery.
 

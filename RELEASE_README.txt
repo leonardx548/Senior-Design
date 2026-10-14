@@ -32,9 +32,10 @@ https://github.com/leonardx548/Senior-Design/releases/latest
 Automatic archives
 ------------------
 Use File > Configure Auto-Archive... to choose an existing destination folder
-and the data included in each ZIP. The application writes a verified ZIP after
-each hour of active cycle-counting time and writes the remaining partial ZIP
-when counting stops. It retains local data if an archive cannot be created.
+the data included in each ZIP, and an archive interval. The application writes
+a verified ZIP after the selected active cycle-counting interval (15 minutes,
+30 minutes, 1 hour, or 2 hours) and writes the remaining partial ZIP when
+counting stops. It retains local data if an archive cannot be created.
 
 Auxiliary channels
 ------------------

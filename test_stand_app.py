@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.6"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -42,6 +42,12 @@ SNAPSHOT_HISTORY_SECONDS = 120
 SNAPSHOT_STREAM_RATE_HZ = 200
 SNAPSHOT_HISTORY_MAX_SAMPLES = SNAPSHOT_HISTORY_SECONDS * SNAPSHOT_STREAM_RATE_HZ
 AUTO_ARCHIVE_INTERVAL_SECONDS = 60 * 60
+AUTO_ARCHIVE_INTERVAL_OPTIONS = (
+    ("15 minutes", 15 * 60),
+    ("30 minutes", 30 * 60),
+    ("1 hour", AUTO_ARCHIVE_INTERVAL_SECONDS),
+    ("2 hours", 2 * 60 * 60),
+)
 AUTO_ARCHIVE_CONFIG_FILENAME = "auto_archive.json"
 VELOCITY_SLOPE_WINDOW_SAMPLES = 11
 VELOCITY_ZERO_DEADBAND_DPS = 0.25
@@ -60,6 +66,13 @@ EXPORT_FILE_OPTIONS = (
     ("metadata", "Run metadata", "live_run.json"),
     ("configuration", "Run configuration", "run_configuration.json"),
 )
+
+
+def auto_archive_interval_label(interval_seconds: int) -> str:
+    for label, value in AUTO_ARCHIVE_INTERVAL_OPTIONS:
+        if value == interval_seconds:
+            return label
+    return "1 hour"
 
 
 @dataclass
@@ -1019,28 +1032,35 @@ class ExportDataDialog(tk.Toplevel):
 
 
 class AutoArchiveDialog(tk.Toplevel):
-    """Configure hands-off, hourly ZIP archives for active test time."""
+    """Configure hands-off ZIP archives for active test time."""
 
     def __init__(self, app: "TestStandApp") -> None:
         super().__init__(app)
         self.app = app
         self.title("Configure Automatic Archives")
-        self.geometry("760x470")
-        self.minsize(680, 430)
+        self.geometry("760x520")
+        self.minsize(680, 480)
         self.resizable(False, False)
         self.transient(app)
         config = app.auto_archive_config
         self.enabled_var = tk.BooleanVar(value=bool(config["enabled"]))
         self.directory_var = tk.StringVar(value=str(config["directory"]))
+        self.interval_var = tk.StringVar(value=auto_archive_interval_label(int(config["interval_seconds"])))
         selected = set(config["include"])
         self.option_vars = {key: tk.BooleanVar(value=key in selected) for key, _label, _filename in EXPORT_FILE_OPTIONS}
         self.status_var = tk.StringVar(
             value="Settings changed during a test apply when the next test starts."
-            if app.is_running else "Archives are created after each active hour."
+            if app.is_running else f"Archives are created after each active {self.interval_var.get().lower()}."
         )
         self._build()
+        self.interval_var.trace_add("write", self._update_interval_status)
         self.lift()
         self.focus_force()
+
+    def _update_interval_status(self, *_args: object) -> None:
+        """Keep the timing summary aligned with the selected interval."""
+        if not self.app.is_running:
+            self.status_var.set(f"Archives are created after each active {self.interval_var.get().lower()}.")
 
     def _build(self) -> None:
         outer = ttk.Frame(self, padding=18)
@@ -1049,7 +1069,7 @@ class AutoArchiveDialog(tk.Toplevel):
         ttk.Label(
             outer,
             text=(
-                "While cycle counting is active, the app creates a verified ZIP after each hour of active test time. "
+                "While cycle counting is active, the app creates a verified ZIP at the selected active-test interval. "
                 "Stopping counting creates a final ZIP for the remaining portion. Local segment data is removed only "
                 "after that archive succeeds."
             ),
@@ -1062,6 +1082,18 @@ class AutoArchiveDialog(tk.Toplevel):
             text="Automatically archive active test data",
             variable=self.enabled_var,
         ).pack(anchor="w", pady=(0, 12))
+
+        timing = ttk.LabelFrame(outer, text="Archive interval", padding=10)
+        timing.pack(fill="x", pady=(0, 12))
+        ttk.Label(timing, text="Create an archive every").pack(side="left")
+        ttk.Combobox(
+            timing,
+            textvariable=self.interval_var,
+            values=tuple(label for label, _seconds in AUTO_ARCHIVE_INTERVAL_OPTIONS),
+            state="readonly",
+            width=14,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(timing, text="of active test time").pack(side="left", padx=(5, 0))
 
         directory = ttk.LabelFrame(outer, text="Archive folder", padding=10)
         directory.pack(fill="x")
@@ -1097,6 +1129,8 @@ class AutoArchiveDialog(tk.Toplevel):
     def save(self) -> None:
         selected_keys = [key for key, _label, _filename in EXPORT_FILE_OPTIONS if self.option_vars[key].get()]
         directory = self.directory_var.get().strip()
+        interval_by_label = {label: seconds for label, seconds in AUTO_ARCHIVE_INTERVAL_OPTIONS}
+        interval_seconds = interval_by_label.get(self.interval_var.get(), AUTO_ARCHIVE_INTERVAL_SECONDS)
         if self.enabled_var.get() and not directory:
             messagebox.showerror("Archive folder required", "Choose a folder for automatic ZIP archives.", parent=self)
             return
@@ -1110,6 +1144,7 @@ class AutoArchiveDialog(tk.Toplevel):
             enabled=self.enabled_var.get(),
             directory=directory,
             include=selected_keys,
+            interval_seconds=interval_seconds,
         )
         if self.app.is_running:
             self.app.log_event("Automatic archive settings changed", "The updated settings apply to the next test run.")
@@ -1620,7 +1655,7 @@ class TestStandApp(tk.Tk):
             },
             "automatic_archive": {
                 "enabled": self.auto_archive_config["enabled"],
-                "interval_seconds": AUTO_ARCHIVE_INTERVAL_SECONDS,
+                "interval_seconds": self.auto_archive_config["interval_seconds"],
                 "included_data": self.auto_archive_config["include"],
             },
             "position_calibration": self.position_calibration,
@@ -1636,7 +1671,12 @@ class TestStandApp(tk.Tk):
 
     @staticmethod
     def _default_auto_archive_config() -> dict[str, object]:
-        return {"enabled": False, "directory": "", "include": [key for key, _label, _file in EXPORT_FILE_OPTIONS]}
+        return {
+            "enabled": False,
+            "directory": "",
+            "include": [key for key, _label, _file in EXPORT_FILE_OPTIONS],
+            "interval_seconds": AUTO_ARCHIVE_INTERVAL_SECONDS,
+        }
 
     def load_auto_archive_config(self) -> dict[str, object]:
         """Read a conservative, validated auto-archive configuration."""
@@ -1649,17 +1689,28 @@ class TestStandApp(tk.Tk):
             configured_keys = config["include"]
         allowed_keys = {key for key, _label, _file in EXPORT_FILE_OPTIONS}
         include = [str(key) for key in configured_keys if str(key) in allowed_keys]
+        allowed_intervals = {seconds for _label, seconds in AUTO_ARCHIVE_INTERVAL_OPTIONS}
+        try:
+            interval_seconds = int(saved.get("interval_seconds", config["interval_seconds"]))
+        except (TypeError, ValueError):
+            interval_seconds = AUTO_ARCHIVE_INTERVAL_SECONDS
+        if interval_seconds not in allowed_intervals:
+            interval_seconds = AUTO_ARCHIVE_INTERVAL_SECONDS
         return {
             "enabled": bool(saved.get("enabled", False)),
             "directory": str(saved.get("directory", "")).strip(),
             "include": include or list(config["include"]),
+            "interval_seconds": interval_seconds,
         }
 
-    def configure_auto_archive(self, *, enabled: bool, directory: str, include: list[str]) -> None:
+    def configure_auto_archive(
+        self, *, enabled: bool, directory: str, include: list[str], interval_seconds: int
+    ) -> None:
         self.auto_archive_config = {
             "enabled": bool(enabled),
             "directory": directory,
             "include": include,
+            "interval_seconds": interval_seconds,
         }
         self.paths.write_config(AUTO_ARCHIVE_CONFIG_FILENAME, self.auto_archive_config)
         self._write_run_configuration_snapshot()
@@ -1689,6 +1740,7 @@ class TestStandApp(tk.Tk):
             "enabled": self.auto_archive_config["enabled"],
             "directory": self.auto_archive_config["directory"],
             "include": list(self.auto_archive_config["include"]),
+            "interval_seconds": self.auto_archive_config["interval_seconds"],
         }
         self.auto_archive_active = self._auto_archive_config_is_ready(candidate)
         self.active_auto_archive_config = candidate if self.auto_archive_active else None
@@ -1696,7 +1748,7 @@ class TestStandApp(tk.Tk):
             self.auto_archive_segment_number = 1
             self.log_event(
                 "Automatic archive enabled",
-                "Segment 1 will be archived after one hour of active test time.",
+                f"Segment 1 will be archived after {auto_archive_interval_label(int(candidate['interval_seconds'])).lower()} of active test time.",
             )
         elif self.auto_archive_config["enabled"]:
             self.log_event(
@@ -1744,6 +1796,7 @@ class TestStandApp(tk.Tk):
                     "archive_reason": reason,
                     "segment_number": self.auto_archive_segment_number,
                     "active_test_seconds": round(segment_seconds, 1),
+                    "archive_interval_seconds": int(self.active_auto_archive_config["interval_seconds"]),
                 },
             )
         except (OSError, ValueError, csv.Error, zipfile.BadZipFile) as error:
@@ -2536,8 +2589,9 @@ class TestStandApp(tk.Tk):
             self.test_elapsed_seconds += elapsed
         if self.is_running and self.auto_archive_active:
             self.auto_archive_elapsed_seconds += elapsed
-            if self.auto_archive_elapsed_seconds >= AUTO_ARCHIVE_INTERVAL_SECONDS:
-                self._archive_auto_segment("hourly_archive", "hourly", continue_running=True)
+            interval_seconds = int(self.active_auto_archive_config["interval_seconds"])
+            if self.auto_archive_elapsed_seconds >= interval_seconds:
+                self._archive_auto_segment("scheduled_archive", "scheduled", continue_running=True)
         self.metric_vars["cycles"].set(str(self.cycles))
         self.metric_vars["frequency"].set(f"{self._frequency():0.1f} cpm")
         self.metric_vars["test_time"].set(self._format_test_time(self.test_elapsed_seconds))
