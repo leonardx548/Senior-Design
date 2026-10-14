@@ -36,7 +36,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.19"
+APP_VERSION = "0.3.20"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -1588,8 +1588,8 @@ class TestStandApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Senior Design Test Stand")
-        self.minsize(1040, 720)
-        self.geometry("1240x820")
+        self.minsize(1120, 720)
+        self.geometry("1360x860")
         self.configure(background="#f1f5f9")
 
         self.paths = AppPaths.create(Path(__file__).resolve().parent)
@@ -1766,7 +1766,7 @@ class TestStandApp(tk.Tk):
         ).pack(side="left", padx=(8, 0))
 
     def _build_interface(self) -> None:
-        header = ttk.Frame(self, style="Header.TFrame", padding=(24, 15))
+        header = ttk.Frame(self, style="Header.TFrame", padding=(24, 12))
         header.pack(fill="x")
         header.columnconfigure(0, weight=1)
         title = ttk.Frame(header, style="Header.TFrame")
@@ -1784,80 +1784,34 @@ class TestStandApp(tk.Tk):
 
         main = ttk.Frame(self, padding=16)
         main.pack(fill="both", expand=True)
-        main.columnconfigure(0, weight=3)
-        main.columnconfigure(1, weight=2)
-        main.rowconfigure(2, weight=1)
+        main.columnconfigure(0, weight=4, minsize=700)
+        main.columnconfigure(1, weight=2, minsize=330)
+        main.rowconfigure(1, weight=1)
 
         self.metrics = ttk.Frame(main)
         self.metrics.grid(row=0, column=0, columnspan=2, sticky="ew")
         for column in range(5):
             self.metrics.columnconfigure(column, weight=1, uniform="metrics")
-        for row in range(2):
-            self.metrics.rowconfigure(row, weight=1)
 
         self.metric_vars: dict[str, tk.StringVar] = {}
         self._metric(self.metrics, 0, 0, "Completed Cycles", "cycles", "0", None)
-        self._metric(self.metrics, 0, 1, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
-        self._metric(self.metrics, 0, 2, "Bushing Velocity", "velocity", "— °/s", None)
         self._metric(
-            self.metrics, 0, 3, "Cycle Frequency", "frequency", "0.0 cpm", None,
+            self.metrics, 0, 1, "Cycle Frequency", "frequency", "0.0 cpm", None,
             expand_command=self.open_cycle_frequency_history_window,
         )
-        self._metric(self.metrics, 0, 4, "Grease Pressure", "pressure", "— psi", "Input not configured")
-        self._metric(self.metrics, 1, 0, "Test Time", "test_time", "00:00:00", None)
-        self._metric(
-            self.metrics, 1, 1, "Temperature 1", "temp_1", "— °F", "Input not configured",
-            expand_command=lambda: self.open_temperature_history_window(1),
-        )
-        self._metric(
-            self.metrics, 1, 2, "Temperature 2", "temp_2", "— °F", "Input not configured",
-            expand_command=lambda: self.open_temperature_history_window(2),
-        )
+        self._metric(self.metrics, 0, 2, "Test Time", "test_time", "00:00:00", None)
+        self._metric(self.metrics, 0, 3, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
+        self._metric(self.metrics, 0, 4, "Bushing Velocity", "velocity", "— °/s", None)
 
-        controls = ttk.LabelFrame(main, text="Test Controls", padding=12)
-        controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 10))
-        controls.columnconfigure(6, weight=1)
-
-        count_buttons = ttk.Frame(controls)
-        count_buttons.grid(row=0, column=0, padx=(0, 12), sticky="w")
-        self.start_button = ttk.Button(
-            count_buttons, text="Start Counting", style="Start.TButton", command=self.start_counting, state="disabled"
-        )
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(
-            count_buttons, text="Stop", style="Stop.TButton", command=self.stop_counting, state="disabled"
-        )
-        self.stop_button.pack(side="left", padx=(6, 0))
-        self.reset_button = ttk.Button(count_buttons, text="Reset", command=self.reset_counting)
-        self.reset_button.pack(side="left", padx=(6, 0))
-        self.calibrate_button = ttk.Button(controls, text="Calibrate AIN2 Position", command=self.open_calibration_window)
-        self.calibrate_button.grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(12, 0)
-        )
-        calibration_text = "Calibration saved" if self.position_calibration else "Calibration required"
-        ttk.Label(controls, text=calibration_text, foreground="#475569").grid(
-            row=1, column=2, columnspan=4, sticky="w", pady=(12, 0)
-        )
-        self.cycle_stops_button = ttk.Button(
-            controls, text="Input Cycle Stops", command=self.open_cycle_stops_window
-        )
-        self.cycle_stops_button.grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0)
-        )
-        ttk.Label(controls, textvariable=self.cycle_stops_var, foreground="#475569").grid(
-            row=2, column=2, columnspan=4, sticky="w", pady=(10, 0)
-        )
-
-        self.chart_holder = ttk.Frame(main)
-        self.chart_holder.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
+        self.chart_holder = ttk.LabelFrame(main, text="Live Motion", padding=10)
+        self.chart_holder.grid(row=1, column=0, sticky="nsew", padx=(0, 10), pady=(14, 0))
         self.chart_holder.columnconfigure(0, weight=1)
         self.chart_holder.columnconfigure(1, weight=1)
-        self.chart_holder.columnconfigure(2, weight=1)
-        self.chart_holder.rowconfigure(1, weight=1)
+        self.chart_holder.rowconfigure(1, weight=3)
+        self.chart_holder.rowconfigure(2, weight=2)
         chart_toolbar = ttk.Frame(self.chart_holder)
-        chart_toolbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 5))
-        ttk.Label(chart_toolbar, text="Position and velocity", foreground="#475569").pack(side="left")
-        ttk.Label(chart_toolbar, textvariable=self.graph_window_var, foreground="#64748b").pack(side="left", padx=(12, 0))
+        chart_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Label(chart_toolbar, textvariable=self.graph_window_var, foreground="#64748b").pack(side="left")
         self.pan_left_graph_button = ttk.Button(
             chart_toolbar, text="◀", width=3, style="Icon.TButton", command=lambda: self.pan_paused_graphs(SNAPSHOT_PAN_STEP_SECONDS)
         )
@@ -1873,23 +1827,19 @@ class TestStandApp(tk.Tk):
         )
         self.save_snapshot_button.pack(side="right", padx=(0, 6))
         ttk.Button(
-            chart_toolbar,
-            text="⛶",
-            width=3,
-            style="Icon.TButton",
-            command=self.open_graph_review_window,
+            chart_toolbar, text="⛶", width=3, style="Icon.TButton", command=self.open_graph_review_window,
         ).pack(side="right", padx=(0, 6))
-        self.bushing_plot = LivePlot(self.chart_holder, "Live AIN2 voltage (V) — calibration not set", 5.0, "#0891b2")
-        self.bushing_plot.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        self.bushing_plot = LivePlot(self.chart_holder, "Live bushing position (degrees, calibrated AIN2)", 5.0, "#0891b2")
+        self.bushing_plot.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=(0, 6))
         self.configure_bushing_plot(clear_samples=False)
         self.velocity_plot = LivePlot(
             self.chart_holder,
-            "Live bushing velocity (°/s) — calibration required",
+            "Live bushing velocity (°/s, calibrated AIN2)",
             DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
             "#2563eb",
             minimum=-DEFAULT_VELOCITY_GRAPH_LIMIT_DPS,
         )
-        self.velocity_plot.grid(row=1, column=1, sticky="nsew", padx=5)
+        self.velocity_plot.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=(0, 6))
         self.configure_velocity_plot(clear_samples=False)
         self.pressure_plot = LivePlot(
             self.chart_holder,
@@ -1897,14 +1847,63 @@ class TestStandApp(tk.Tk):
             5000.0,
             "#d97706",
         )
-        self.pressure_plot.grid(row=1, column=2, sticky="nsew", padx=(5, 0))
+        self.pressure_plot.grid(row=2, column=0, columnspan=2, sticky="nsew")
         self.pressure_plot.set_reference_lines([
             (INJECTOR_ACTIVATION_PSI, "#7c3aed", "Injector activation"),
         ])
         self._update_graph_pan_controls()
 
-        status_box = ttk.LabelFrame(main, text="Recent Events", padding=12)
-        status_box.grid(row=2, column=1, sticky="nsew")
+        sidebar = ttk.Frame(main)
+        sidebar.grid(row=1, column=1, sticky="nsew", pady=(14, 0))
+        sidebar.columnconfigure(0, weight=1)
+        sidebar.rowconfigure(2, weight=1)
+
+        controls = ttk.LabelFrame(sidebar, text="Test Controls", padding=12)
+        controls.grid(row=0, column=0, sticky="ew")
+        controls.columnconfigure(0, weight=1)
+
+        count_buttons = ttk.Frame(controls)
+        count_buttons.grid(row=0, column=0, sticky="ew")
+        self.start_button = ttk.Button(
+            count_buttons, text="Start Counting", style="Start.TButton", command=self.start_counting, state="disabled"
+        )
+        self.start_button.pack(side="left", fill="x", expand=True)
+        self.stop_button = ttk.Button(
+            count_buttons, text="Stop", style="Stop.TButton", command=self.stop_counting, state="disabled"
+        )
+        self.stop_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.reset_button = ttk.Button(count_buttons, text="Reset", command=self.reset_counting)
+        self.reset_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.calibrate_button = ttk.Button(controls, text="Calibrate AIN2 Position", command=self.open_calibration_window)
+        self.calibrate_button.grid(row=1, column=0, sticky="w", pady=(12, 0))
+        calibration_text = "Calibration saved" if self.position_calibration else "Calibration required"
+        ttk.Label(controls, text=calibration_text, foreground="#475569").grid(row=2, column=0, sticky="w", pady=(3, 0))
+        self.cycle_stops_button = ttk.Button(
+            controls, text="Input Cycle Stops", command=self.open_cycle_stops_window
+        )
+        self.cycle_stops_button.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(controls, textvariable=self.cycle_stops_var, foreground="#475569", wraplength=280).grid(
+            row=4, column=0, sticky="w", pady=(3, 0)
+        )
+
+        auxiliary = ttk.LabelFrame(sidebar, text="Auxiliary Inputs", padding=8)
+        auxiliary.grid(row=1, column=0, sticky="ew", pady=(10, 10))
+        auxiliary.columnconfigure(0, weight=1)
+        auxiliary.columnconfigure(1, weight=1)
+        self._metric(
+            auxiliary, 0, 0, "Grease Pressure", "pressure", "— psi", "Input not configured", columnspan=2,
+        )
+        self._metric(
+            auxiliary, 1, 0, "Temperature 1", "temp_1", "— °F", "Input not configured",
+            expand_command=lambda: self.open_temperature_history_window(1),
+        )
+        self._metric(
+            auxiliary, 1, 1, "Temperature 2", "temp_2", "— °F", "Input not configured",
+            expand_command=lambda: self.open_temperature_history_window(2),
+        )
+
+        status_box = ttk.LabelFrame(sidebar, text="Recent Events", padding=10)
+        status_box.grid(row=2, column=0, sticky="nsew")
         event_toolbar = ttk.Frame(status_box)
         event_toolbar.pack(fill="x", pady=(0, 6))
         ttk.Label(event_toolbar, text="Latest application activity", foreground="#475569").pack(side="left")
@@ -1931,10 +1930,12 @@ class TestStandApp(tk.Tk):
         detail: str | tk.StringVar | None,
         *,
         expand_command: Callable[[], None] | None = None,
+        columnspan: int = 1,
     ) -> ttk.Frame:
         frame = ttk.Frame(parent, style="Metric.TFrame", padding=(12, 10))
         frame.grid(
-            row=row, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0), pady=(0 if row == 0 else 5, 0)
+            row=row, column=column, columnspan=columnspan, sticky="nsew",
+            padx=(0 if column == 0 else 5, 0), pady=(0 if row == 0 else 5, 0),
         )
         heading = ttk.Frame(frame, style="MetricHeader.TFrame")
         heading.pack(fill="x")
