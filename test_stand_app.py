@@ -33,7 +33,7 @@ from labjack_diagnostic import summarize_ain2_samples
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 2500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -339,12 +339,16 @@ class LivePlot(tk.Canvas):
         self.minimum = minimum
         self.maximum = maximum
         self.color = color
-        self.samples: deque[float] = deque(maxlen=120)
+        self.samples: deque[tuple[float, float]] = deque()
+        self.history_seconds = SNAPSHOT_HISTORY_SECONDS
         self.reference_lines: list[tuple[float, str, str]] = []
         self.bind("<Configure>", lambda _event: self.redraw())
 
-    def add(self, value: float) -> None:
-        self.samples.append(max(self.minimum, min(self.maximum, value)))
+    def add(self, value: float, sample_monotonic: float | None = None) -> None:
+        sample_time = time.monotonic() if sample_monotonic is None else sample_monotonic
+        self.samples.append((sample_time, max(self.minimum, min(self.maximum, value))))
+        while self.samples and self.samples[0][0] < sample_time - self.history_seconds:
+            self.samples.popleft()
         self.redraw()
 
     def set_scale(self, title: str, minimum: float, maximum: float, clear_samples: bool = True) -> None:
@@ -369,6 +373,8 @@ class LivePlot(tk.Canvas):
             "color": self.color,
             "samples": tuple(self.samples),
             "reference_lines": tuple(self.reference_lines),
+            "history_seconds": self.history_seconds,
+            "window_end_monotonic": self.samples[-1][0] if self.samples else time.monotonic(),
             "width": max(self.winfo_width(), 600),
             "height": max(self.winfo_height(), 240),
         }
@@ -379,8 +385,11 @@ class LivePlot(tk.Canvas):
         width, height = int(state["width"]), int(state["height"])
         minimum, maximum = float(state["minimum"]), float(state["maximum"])
         title, color = str(state["title"]), str(state["color"])
-        samples = tuple(float(value) for value in state["samples"])
+        samples = tuple((float(sample[0]), float(sample[1])) for sample in state["samples"])
         reference_lines = tuple(state["reference_lines"])
+        history_seconds = float(state["history_seconds"])
+        window_end = float(state["window_end_monotonic"])
+        window_start = window_end - history_seconds
         margin_left, margin_right, margin_top, margin_bottom = 42, 14, 28, 28
         chart_width = width - margin_left - margin_right
         chart_height = height - margin_top - margin_bottom
@@ -397,7 +406,7 @@ class LivePlot(tk.Canvas):
                 f'<text x="{margin_left - 5}" y="{y + 3:.2f}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">{value:,.1f}</text>',
             ))
         lines.extend((
-            f'<text x="{margin_left}" y="{height - 8}" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">older</text>',
+            f'<text x="{margin_left}" y="{height - 8}" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">{history_seconds:g}s ago</text>',
             f'<text x="{width - margin_right}" y="{height - 8}" text-anchor="end" fill="#64748b" font-family="Segoe UI, Arial" font-size="9">now</text>',
         ))
         for reference in reference_lines:
@@ -410,8 +419,8 @@ class LivePlot(tk.Canvas):
                 ))
         if len(samples) >= 2:
             points = []
-            for index, value in enumerate(samples):
-                x = margin_left + chart_width * index / (len(samples) - 1)
+            for sample_time, value in samples:
+                x = margin_left + chart_width * max(0.0, min(1.0, (sample_time - window_start) / history_seconds))
                 y = margin_top + chart_height * (1 - (value - minimum) / (maximum - minimum))
                 points.append(f"{x:.2f},{y:.2f}")
             lines.append(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="2"/>')
@@ -433,7 +442,9 @@ class LivePlot(tk.Canvas):
             value = self.minimum + (self.maximum - self.minimum) * fraction
             self.create_text(margin_left - 5, y, text=f"{value:,.1f}",
                              anchor="e", fill="#64748b", font=("Segoe UI", 8))
-        self.create_text(margin_left, height - 9, text="older", anchor="w", fill="#64748b",
+        window_end = self.samples[-1][0] if self.samples else time.monotonic()
+        window_start = window_end - self.history_seconds
+        self.create_text(margin_left, height - 9, text=f"{self.history_seconds:g}s ago", anchor="w", fill="#64748b",
                          font=("Segoe UI", 8))
         self.create_text(width - margin_right, height - 9, text="now", anchor="e", fill="#64748b",
                          font=("Segoe UI", 8))
@@ -447,9 +458,8 @@ class LivePlot(tk.Canvas):
         if len(self.samples) < 2:
             return
         points: list[float] = []
-        count = len(self.samples)
-        for index, value in enumerate(self.samples):
-            x = margin_left + chart_width * index / (count - 1)
+        for sample_time, value in self.samples:
+            x = margin_left + chart_width * max(0.0, min(1.0, (sample_time - window_start) / self.history_seconds))
             y = margin_top + chart_height * (1 - (value - self.minimum) / (self.maximum - self.minimum))
             points.extend([x, y])
         self.create_line(*points, fill=self.color, width=2, smooth=True)
@@ -1314,6 +1324,7 @@ class TestStandApp(tk.Tk):
         self._velocity_angles: deque[float] = deque(maxlen=VELOCITY_SLOPE_WINDOW_SAMPLES)
         self._snapshot_samples: deque[PositionVelocitySnapshotSample] = deque(maxlen=SNAPSHOT_HISTORY_MAX_SAMPLES)
         self._snapshot_stream_gap_pending = False
+        self._latest_snapshot_sample_monotonic: float | None = None
         self.graphs_paused = False
         self._frozen_snapshot_samples: tuple[PositionVelocitySnapshotSample, ...] | None = None
         self._frozen_position_graph: dict[str, object] | None = None
@@ -2076,7 +2087,7 @@ class TestStandApp(tk.Tk):
                 "Live bushing velocity (°/s, calibrated AIN2)", -new_limit, new_limit, clear_samples=False
             )
             self.velocity_plot.set_reference_lines([(0.0, "#94a3b8", "Stationary")])
-        self.velocity_plot.add(self.bushing_velocity)
+        self.velocity_plot.add(self.bushing_velocity, self._latest_snapshot_sample_monotonic)
 
     def _start_cycle_capture(self, retracted: float, extended: float, sample_at: str, sample_monotonic: float) -> None:
         self._cycle_capture = CycleCapture(
@@ -2248,7 +2259,7 @@ class TestStandApp(tk.Tk):
                 detail += " • OUT"
             self.bushing_detail_var.set(detail)
             if not self.graphs_paused:
-                self.bushing_plot.add(angle)
+                self.bushing_plot.add(angle, self._latest_snapshot_sample_monotonic)
         else:
             self.bushing_position, self.bushing_unit = voltage, "volts"
             self.metric_vars["position"].set(f"{voltage:.4f} V")
@@ -2275,12 +2286,14 @@ class TestStandApp(tk.Tk):
                 stream_gap_before=self._snapshot_stream_gap_pending,
             )
         )
+        self._latest_snapshot_sample_monotonic = sample_monotonic
         self._snapshot_stream_gap_pending = False
 
     def _clear_snapshot_history(self) -> None:
         """Discard incompatible raw history after changing the position calibration."""
         self._snapshot_samples.clear()
         self._snapshot_stream_gap_pending = False
+        self._latest_snapshot_sample_monotonic = None
         self.graphs_paused = False
         self._frozen_snapshot_samples = None
         self._frozen_position_graph = None
