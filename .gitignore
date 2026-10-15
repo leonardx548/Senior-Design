@@ -8,3 +8,4 @@ cycle_stops.json
 build/
 dist/
 release/
+*.spec

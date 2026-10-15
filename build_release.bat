@@ -2,24 +2,29 @@
 setlocal
 cd /d "%~dp0"
 
-where py >nul 2>nul
+set "PYTHON_CMD=py -3"
+py -3 --version >nul 2>nul
 if errorlevel 1 (
-    echo Python Launcher was not found. Install Python 3.10 or newer with "Add Python to PATH" selected.
-    pause
-    exit /b 1
+    where python >nul 2>nul
+    if errorlevel 1 (
+        echo Python 3.10 or newer was not found. Install it with "Add Python to PATH" selected.
+        pause
+        exit /b 1
+    )
+    set "PYTHON_CMD=python"
 )
 
-py -3 -m pip install --upgrade pyinstaller
+%PYTHON_CMD% -m pip install --upgrade pyinstaller
 if errorlevel 1 goto :failed
 
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist release rmdir /s /q release
 
-py -3 -m PyInstaller --noconfirm --clean --windowed --onedir --name TestStand --hidden-import labjack test_stand_app.py
+%PYTHON_CMD% -m PyInstaller --noconfirm --clean --windowed --onedir --name TestStand --hidden-import labjack test_stand_app.py
 if errorlevel 1 goto :failed
 
-py -3 -m PyInstaller --noconfirm --clean --console --onefile --name TestStandLabJackDiagnostic --hidden-import labjack --distpath dist\TestStand labjack_diagnostic.py
+%PYTHON_CMD% -m PyInstaller --noconfirm --clean --console --onefile --name TestStandLabJackDiagnostic --hidden-import labjack --distpath dist\TestStand labjack_diagnostic.py
 if errorlevel 1 goto :failed
 
 copy /y "README.md" "dist\TestStand\README.md" >nul
