@@ -20,7 +20,13 @@ from typing import Any
 
 APP_DATA_ENVIRONMENT_VARIABLE = "SENIOR_DESIGN_DATA_DIR"
 APP_DATA_FOLDER_NAME = "SeniorDesignTestStand"
-CONFIG_FILENAMES = ("position_calibration.json", "cycle_stops.json")
+CONFIG_FILENAMES = (
+    "position_calibration.json",
+    "pressure_calibration.json",
+    "temperature_calibration.json",
+    "cycle_stops.json",
+    "run_output.json",
+)
 LIVE_RUNS_FILENAME = "live_runs.json"
 
 
@@ -47,7 +53,6 @@ class AppPaths:
 
     root: Path
     config: Path
-    logs: Path
     migrated_legacy_config: tuple[str, ...] = ()
 
     @classmethod
@@ -61,9 +66,7 @@ class AppPaths:
             root = base / APP_DATA_FOLDER_NAME
 
         config = root / "config"
-        logs = root / "logs"
         config.mkdir(parents=True, exist_ok=True)
-        logs.mkdir(parents=True, exist_ok=True)
 
         migrated: list[str] = []
         for filename in CONFIG_FILENAMES:
@@ -73,7 +76,7 @@ class AppPaths:
                 # Copy, rather than move, so the first upgraded run never risks existing data.
                 shutil.copy2(legacy, destination)
                 migrated.append(filename)
-        return cls(root=root, config=config, logs=logs, migrated_legacy_config=tuple(migrated))
+        return cls(root=root, config=config, migrated_legacy_config=tuple(migrated))
 
     def read_config(self, filename: str) -> dict[str, Any] | None:
         try:
@@ -91,32 +94,16 @@ class AppPaths:
         except FileNotFoundError:
             pass
 
-    def list_run_directories(self) -> list[Path]:
-        """Return saved run folders newest first, including any still-active run."""
-        return sorted(
-            (folder for folder in self.logs.glob("session_*") if folder.is_dir()),
-            key=lambda folder: folder.name,
-            reverse=True,
-        )
-
-    def delete_run_directory(self, folder: Path) -> None:
-        """Remove one verified application-session folder, never the logs folder itself."""
-        logs_root = self.logs.resolve()
-        target = folder.resolve()
-        if target.parent != logs_root or not target.is_dir() or not target.name.startswith("session_"):
-            raise ValueError("Only a saved application-session folder can be removed.")
-        shutil.rmtree(target)
-
-
 class CsvLogger:
-    """Keeps a per-run record in the app's machine-local logs directory."""
+    """Keeps one durable test round in one direct-output folder."""
 
-    def __init__(self, logs_directory: Path) -> None:
-        base_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-        folder = logs_directory / base_name
+    def __init__(self, output_root: Path) -> None:
+        output_root.mkdir(parents=True, exist_ok=True)
+        base_name = datetime.now().strftime("Run_%Y%m%d_%H%M%S")
+        folder = output_root / base_name
         suffix = 2
         while folder.exists():
-            folder = logs_directory / f"{base_name}_{suffix:02d}"
+            folder = output_root / f"{base_name}_{suffix:02d}"
             suffix += 1
         folder.mkdir(parents=True)
         self.folder = folder
@@ -174,9 +161,12 @@ class CsvLogger:
                 "pressure_baseline_psi",
                 "pressure_peak_psi",
                 "pressure_peak_at",
-                "pressure_time_to_2500_psi_seconds",
+                "pressure_time_to_1500_psi_seconds",
+                "pressure_response_threshold_psi",
                 "pressure_response_window_seconds",
                 "pressure_sample_count",
+                "overlapping_grease_event_ids",
+                "comparison_quality",
                 "analysis_status",
             ]
         )
@@ -214,7 +204,7 @@ class CsvLogger:
 
     @staticmethod
     def read_live_runs(folder: Path) -> list[dict[str, Any]]:
-        """Return logical runs from one application-session folder, oldest first."""
+        """Return the retained test-round metadata for a direct run folder."""
         try:
             values = json.loads((folder / LIVE_RUNS_FILENAME).read_text(encoding="utf-8"))
             return values if isinstance(values, list) else []
@@ -237,7 +227,7 @@ class CsvLogger:
         self._write_json_atomic(self.live_runs_path, runs)
 
     def begin_live_run(self, configuration: dict[str, Any], completed_cycles_at_start: int) -> dict[str, Any]:
-        """Create a logical test run within this always-recording app session."""
+        """Initialize the single test round recorded in this output folder."""
         runs = self._live_runs()
         run = {
             "schema_version": 2,
@@ -299,7 +289,7 @@ class CsvLogger:
         self.update_manifest(
             status="completed",
             ended_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-            duration_seconds=round(time.monotonic() - self.started_monotonic, 1),
+            wall_duration_seconds=round(time.monotonic() - self.started_monotonic, 1),
             **values,
         )
 
@@ -364,8 +354,11 @@ class CsvLogger:
                 values["pressure_peak"],
                 values["pressure_peak_at"],
                 values["pressure_time_to_threshold"],
+                values["pressure_response_threshold_psi"],
                 values["pressure_response_window_seconds"],
                 values["pressure_sample_count"],
+                values["overlapping_grease_event_ids"],
+                values["comparison_quality"],
                 values["analysis_status"],
             ]
         )

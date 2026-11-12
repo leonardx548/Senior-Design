@@ -1,50 +1,39 @@
-Senior Design Test Stand - Windows Application
-===============================================
+Senior Design Test Stand
+========================
 
-Start the application
----------------------
-1. Extract this entire ZIP to a normal folder. Do not run the application from
-   inside the ZIP archive.
-2. Double-click TestStand.exe.
+1. Extract the ZIP to a normal folder. Do not run it from inside the ZIP.
+2. If using the physical T4, double-click `Install LabJack Driver.url` and install LJM.
+3. Run `Verify LabJack.bat`; confirm `Connection: SUCCESS`.
+4. Run `TestStand.exe`.
 
-Physical LabJack T4 operation
------------------------------
-The application opens on any Windows computer. It does not generate
-placeholder sensor values.
+Live LabJack T4
+---------------
+The driver installer page is included as `Install LabJack Driver.url`.
+`Verify LabJack.bat` keeps the diagnostic result visible after it finishes.
 
-For live bushing position and cycle counting:
-1. Install the official LabJack LJM Windows driver/library once on this
-   computer. Windows administrator access may be required for the driver.
-   Download page: https://support.labjack.com/docs/ljm-software-installer-windows
-2. Connect the LabJack T4 by USB.
-3. Double-click TestStandLabJackDiagnostic.exe and confirm it reports
-   "Connection: SUCCESS".
-4. Start TestStand.exe.
+Python and the application dependencies are included. Do not install Python or run pip for this package.
 
-The Bushing Velocity card and graph become active after the two-point AIN2
-position calibration is saved.
+Use Calibrate AIN2 Position for bushing position: enter the angles at the
+low/high AIN2-voltage endpoints, then move through full travel during its
+10-second capture. Tools > Calibrate FIO4 Pressure is for grease pressure.
+FIO4/AIN4 accepts 0–2.5 V only.
 
-Python is already included in this package. Do not install Python or run pip.
+Use Tools > Configure Temperatures for the Type T probes on AIN0/AIN1. Capture
+T4 Estimate supplies a nominal USB air-temperature CJC value; a measurement at
+the LJTick terminal connections remains more direct.
 
-The newest application ZIP is always on the project's Releases page:
+Run data is written live to:
+%LOCALAPPDATA%\SeniorDesignTestStand\runs\Run_...
+
+Use File > Set Run Output Folder... to choose a different location. Each run
+is written to one location only. Start begins a test round, Pause holds it,
+and Save & Reset closes the run folder and clears the dashboard. Pause and
+Save stop the automatic S0 timer and command the output OFF.
+
+Use File > Export Runs... to make an optional ZIP of selected run files.
+
+PS12DC S0 is the only physical output. During an active run, confirmed ON
+events are recorded as grease injections. Verify wiring and supply limits first.
+
+Latest release:
 https://github.com/leonardx548/Senior-Design/releases/latest
-
-Automatic archives
-------------------
-Use File > Configure Auto-Archive... to choose an existing destination folder
-the data included in each ZIP, and an archive interval. The application writes
-a verified ZIP after the selected active cycle-counting interval (15 minutes,
-30 minutes, 1 hour, or 2 hours) and writes the remaining partial ZIP when
-counting stops. It retains local data if an archive cannot be created.
-
-Auxiliary channels
-------------------
-The dashboard includes one grease-pressure card and two temperature cards so
-the hardware inputs have a defined operator display. Until those inputs are
-implemented, each card reports "Input not configured" rather than a fake
-reading. The empty grease-pressure graph includes a 2,500 psi injector-
-activation reference line. Use Recent Events > Expand... for the full-size,
-live-updating event terminal.
-
-Each computer keeps its own calibration and run logs under:
-%LOCALAPPDATA%\SeniorDesignTestStand

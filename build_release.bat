@@ -14,27 +14,35 @@ if errorlevel 1 (
     set "PYTHON_CMD=python"
 )
 
-%PYTHON_CMD% -m pip install --upgrade pyinstaller
+%PYTHON_CMD% -m pip install -r requirements.txt
+if errorlevel 1 goto :failed
+
+%PYTHON_CMD% -m pip install pyinstaller
+if errorlevel 1 goto :failed
+
+%PYTHON_CMD% -m unittest -v test_core.py
 if errorlevel 1 goto :failed
 
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist release rmdir /s /q release
 
-%PYTHON_CMD% -m PyInstaller --noconfirm --clean --windowed --onedir --name TestStand --hidden-import labjack test_stand_app.py
+%PYTHON_CMD% -m PyInstaller --noconfirm --clean --windowed --onedir --name TestStand --collect-all labjack test_stand_app.py
 if errorlevel 1 goto :failed
 
-%PYTHON_CMD% -m PyInstaller --noconfirm --clean --console --onefile --name TestStandLabJackDiagnostic --hidden-import labjack --distpath dist\TestStand labjack_diagnostic.py
+%PYTHON_CMD% -m PyInstaller --noconfirm --clean --console --onefile --name TestStandLabJackDiagnostic --collect-all labjack --distpath dist\TestStand labjack_diagnostic.py
 if errorlevel 1 goto :failed
 
 copy /y "README.md" "dist\TestStand\README.md" >nul
 copy /y "RELEASE_README.txt" "dist\TestStand\START_HERE.txt" >nul
+copy /y "Verify LabJack.bat" "dist\TestStand\Verify LabJack.bat" >nul
+copy /y "Install LabJack Driver.url" "dist\TestStand\Install LabJack Driver.url" >nul
 mkdir release
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\TestStand\*' -DestinationPath 'release\SeniorDesignTestStand-v0.3.21-windows.zip' -Force"
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\TestStand\*' -DestinationPath 'release\SeniorDesignTestStand-v0.4.1-windows.zip' -Force"
 
 echo.
 echo Release package created:
-echo   release\SeniorDesignTestStand-v0.3.21-windows.zip
+echo   release\SeniorDesignTestStand-v0.4.1-windows.zip
 pause
 exit /b 0
 

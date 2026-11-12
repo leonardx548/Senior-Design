@@ -1,10 +1,11 @@
-"""Read-only LabJack T4 connectivity diagnostic.
+"""LabJack T4 connectivity diagnostic and shared input/output helper.
 
 Run this separately from the simulation GUI:
     python labjack_diagnostic.py
 
-It never writes to the LabJack.  The LJM open call runs in a child process so
-an LJM/driver crash is reported cleanly instead of taking down the GUI.
+The normal diagnostic modes never write to the LabJack.  The live-stream mode
+also accepts narrowly scoped, explicit PS12DC commands for DIO8, which maps
+to PS12DC S0 when the board is connected to the T4 DB15 port.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from queue import Empty, Queue
 from typing import Any
 
 
@@ -23,6 +25,32 @@ AIN2_SAMPLE_COUNT = 25
 AIN2_SAMPLE_INTERVAL_SECONDS = 0.02
 LIVE_AIN2_STREAM_RATE_HZ = 200
 LIVE_AIN2_STREAM_SCANS_PER_READ = 10
+# AIN2 remains the motion-critical input. AIN0/AIN1 support the raw
+# temperature-wiring check, while FIO4 (AIN4) is the low-voltage grease
+# pressure input. Keeping all five on the same hardware stream avoids
+# competing LabJack connections and keeps cycle counting uninterrupted.
+# AIN14 is the T4's internal temperature-sensor voltage.  It must be included
+# in the stream because T4 analog inputs cannot be read command-response while
+# streaming.
+LIVE_STREAM_CHANNELS = ("AIN0", "AIN1", "AIN2", "AIN4", "AIN14")
+T4_DEVICE_TEMPERATURE_SLOPE_K_PER_VOLT = -92.6
+T4_DEVICE_TEMPERATURE_OFFSET_KELVIN = 467.6
+T4_USB_AIR_TEMPERATURE_OFFSET_CELSIUS = 4.3
+
+
+def t4_device_temperature_celsius_from_ain14(voltage: float) -> float:
+    """Convert the T4's streamed internal AIN14 voltage to device temperature."""
+    value = float(voltage)
+    return value * T4_DEVICE_TEMPERATURE_SLOPE_K_PER_VOLT + T4_DEVICE_TEMPERATURE_OFFSET_KELVIN - 273.15
+
+
+def t4_usb_air_temperature_celsius_from_ain14(voltage: float) -> float:
+    """Return LabJack's USB air-temperature estimate for nominal LJTick CJC."""
+    return t4_device_temperature_celsius_from_ain14(voltage) - T4_USB_AIR_TEMPERATURE_OFFSET_CELSIUS
+# A PS12DC connected to the T4 DB15 (P1) maps S0 -> EIO0/DIO8. Keep the
+# helper deliberately limited to this one requested solenoid output; it must
+# not become a general, unguarded digital-output command channel.
+PS12DC_SOLENOID_OUTPUT = "DIO8"
 # Match the command-response calibration and live stream conversion quality.
 # At 200 Hz with one channel, the T4 has ample margin for resolution index 5.
 AIN2_RESOLUTION_INDEX = 5
@@ -96,10 +124,10 @@ def child_probe() -> int:
         return 1
 
 
-def summarize_ain2_samples(samples: list[float]) -> dict[str, Any]:
-    """Summarize a stable AIN2 sample window from either supported read path."""
+def summarize_voltage_samples(samples: list[float], channel_name: str = "input") -> dict[str, Any]:
+    """Summarize a stable short voltage window from the shared input stream."""
     if not samples:
-        return {"status": "error", "error": "No AIN2 samples were received."}
+        return {"status": "error", "error": f"No {channel_name} samples were received."}
     median = statistics.median(samples)
     median_absolute_deviation = statistics.median(abs(value - median) for value in samples)
     # Remove brief communication/ADC spikes while retaining ordinary T4 noise.
@@ -118,6 +146,11 @@ def summarize_ain2_samples(samples: list[float]) -> dict[str, Any]:
         "raw_sample_count": len(samples),
         "stable": stable,
     }
+
+
+def summarize_ain2_samples(samples: list[float]) -> dict[str, Any]:
+    """Compatibility wrapper for the established position-calibration path."""
+    return summarize_voltage_samples(samples, "AIN2")
 
 
 def ain2_sample_result(ljm: Any, handle: int, count: int, interval_seconds: float) -> dict[str, Any]:
@@ -162,24 +195,93 @@ def sample_ain2() -> int:
                 pass
 
 
-def stream_ain2() -> int:
-    """Continuously emit every AIN2 stream sample for real-time cycle counting.
+def demultiplex_stream_scans(stream_data: list[float], channels: tuple[str, ...] = LIVE_STREAM_CHANNELS) -> dict[str, list[float]]:
+    """Split interleaved LJM stream scans into valid samples for each input.
 
-    This configures only the T4's analog-input stream engine. It does not write
-    outputs or command any external hardware.
+    LJM returns one value for each requested channel in every scan.  The
+    sentinel -9999.0 is an invalid stream value, not a voltage, so it is kept
+    out of the per-channel values.  Keeping this transformation independent of
+    LJM makes the stream packet format straightforward to regression-test.
+    """
+    values = {channel: [] for channel in channels}
+    channel_count = len(channels)
+    if channel_count == 0:
+        return values
+    for offset in range(0, len(stream_data), channel_count):
+        scan = stream_data[offset:offset + channel_count]
+        if len(scan) != channel_count:
+            continue
+        for channel, raw_value in zip(channels, scan):
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if value != -9999.0:
+                values[channel].append(value)
+    return values
+
+
+def auxiliary_stream_scans(stream_data: list[float]) -> list[tuple[float | None, float | None]]:
+    """Return every AIN0/AIN1 scan, retaining invalid values as ``None``.
+
+    Unlike the compatibility sample lists, this preserves one row per hardware
+    scan.  The raw-input capture can therefore show missing readings instead of
+    silently closing a gap in time.
+    """
+    scans: list[tuple[float | None, float | None]] = []
+    channel_count = len(LIVE_STREAM_CHANNELS)
+    for offset in range(0, len(stream_data), channel_count):
+        scan = stream_data[offset:offset + channel_count]
+        if len(scan) != channel_count:
+            continue
+        values: list[float | None] = []
+        for raw_value in scan[:2]:
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = -9999.0
+            values.append(None if value == -9999.0 else value)
+        scans.append((values[0], values[1]))
+    return scans
+
+
+def ps12dc_output_request(command_text: str) -> bool | None:
+    """Parse only an explicit dashboard ON/OFF request for PS12DC S0."""
+    command = command_text.strip().upper().split()
+    if (
+        len(command) == 3
+        and command[0] == "SET_OUTPUT"
+        and command[1] == PS12DC_SOLENOID_OUTPUT
+        and command[2] in {"0", "1"}
+    ):
+        return command[2] == "1"
+    return None
+
+
+def stream_ain2() -> int:
+    """Stream inputs plus AIN14 and service explicit S0 output requests.
+
+    Command-response writes are permitted by the T4 while an analog stream is
+    active.  All writes stay on this process's existing LJM handle, avoiding a
+    competing USB connection and preserving the motion stream.
     """
     handle = None
     stream_active = False
     last_status: str | None = None
     stop_requested = threading.Event()
+    output_requests: Queue[bool] = Queue()
 
     def watch_for_stop_request() -> None:
         """Let the GUI request eStreamStop before it starts calibration reads."""
         try:
             for line in sys.stdin:
-                if line.strip().upper() == "STOP":
+                command = line.strip().upper().split()
+                if command == ["STOP"]:
                     stop_requested.set()
                     return
+                request = ps12dc_output_request(line)
+                if request is not None:
+                    output_requests.put(request)
         except OSError:
             # Process shutdown closes stdin; the finally block below still releases the stream.
             return
@@ -199,21 +301,26 @@ def stream_ain2() -> int:
                     continue
                 try:
                     handle = ljm.openS("T4", "USB", "ANY")
+                    # PS12DC inputs are weakly on when a connected LabJack
+                    # line is left as an input. Establish an explicit low
+                    # state before the stream starts, so S0 always begins OFF.
+                    ljm.eWriteName(handle, PS12DC_SOLENOID_OUTPUT, 0)
                     ljm.eWriteNames(
                         handle,
                         2,
                         ["STREAM_RESOLUTION_INDEX", "STREAM_SETTLING_US"],
                         [AIN2_RESOLUTION_INDEX, AIN2_SETTLING_US],
                     )
-                    ain2_address = ljm.namesToAddresses(1, ["AIN2"])[0]
+                    stream_addresses = ljm.namesToAddresses(len(LIVE_STREAM_CHANNELS), list(LIVE_STREAM_CHANNELS))[0]
                     actual_scan_rate = ljm.eStreamStart(
                         handle,
                         LIVE_AIN2_STREAM_SCANS_PER_READ,
-                        1,
-                        ain2_address,
+                        len(LIVE_STREAM_CHANNELS),
+                        stream_addresses,
                         LIVE_AIN2_STREAM_RATE_HZ,
                     )
                     stream_active = True
+                    print(json.dumps({"status": "output", "channel": PS12DC_SOLENOID_OUTPUT, "enabled": False}), flush=True)
                     last_status = None
                 except Exception as error:
                     if handle is not None:
@@ -231,11 +338,33 @@ def stream_ain2() -> int:
                     continue
 
             try:
+                # Keep all LJM operations on the stream-owning thread.  The
+                # command is applied before the next 50 ms stream read, which
+                # keeps the manual toggle responsive without another handle.
+                while True:
+                    try:
+                        enabled = output_requests.get_nowait()
+                    except Empty:
+                        break
+                    try:
+                        ljm.eWriteName(handle, PS12DC_SOLENOID_OUTPUT, 1 if enabled else 0)
+                        print(json.dumps({"status": "output", "channel": PS12DC_SOLENOID_OUTPUT, "enabled": enabled}), flush=True)
+                    except Exception as error:
+                        print(json.dumps({
+                            "status": "output_error",
+                            "channel": PS12DC_SOLENOID_OUTPUT,
+                            "enabled": enabled,
+                            "error": f"{type(error).__name__}: {error}",
+                        }), flush=True)
                 stream_data, device_backlog, ljm_backlog = ljm.eStreamRead(handle)
                 if stop_requested.is_set():
                     break
-                samples = [float(value) for value in stream_data if float(value) != -9999.0]
-                skipped_samples = len(stream_data) - len(samples)
+                channel_samples = demultiplex_stream_scans(stream_data)
+                raw_auxiliary_scans = auxiliary_stream_scans(stream_data)
+                # The dashboard's existing motion path reads ``samples``. Keep
+                # that name as an AIN2-only compatibility field.
+                samples = channel_samples["AIN2"]
+                skipped_samples = len(raw_auxiliary_scans) - len(samples)
                 # The dashboard may briefly be busy drawing or opening a dialog.
                 # Stamp this batch here, beside eStreamRead, so a queued batch
                 # keeps its true position on the time axis instead of being
@@ -245,6 +374,11 @@ def stream_ain2() -> int:
                 result = {
                     "status": "success",
                     "samples": samples,
+                    "ain0_samples": channel_samples["AIN0"],
+                    "ain1_samples": channel_samples["AIN1"],
+                    "ain4_samples": channel_samples["AIN4"],
+                    "ain14_samples": channel_samples["AIN14"],
+                    "auxiliary_scans": raw_auxiliary_scans,
                     "scan_rate_hz": actual_scan_rate,
                     "skipped_samples": skipped_samples,
                     "device_backlog": device_backlog,
@@ -256,6 +390,10 @@ def stream_ain2() -> int:
                 last_status = "success"
             except Exception as error:
                 if stream_active:
+                    try:
+                        ljm.eWriteName(handle, PS12DC_SOLENOID_OUTPUT, 0)
+                    except Exception:
+                        pass
                     try:
                         ljm.eStreamStop(handle)
                     except Exception:
@@ -271,6 +409,13 @@ def stream_ain2() -> int:
                 time.sleep(0.25)
     finally:
         if handle is not None:
+            # Leave the active PS12DC channel as output-low. The board's
+            # datasheet specifies that an input state is weakly ON, so merely
+            # closing the handle is not a safe substitute for this write.
+            try:
+                ljm.eWriteName(handle, PS12DC_SOLENOID_OUTPUT, 0)
+            except Exception:
+                pass
             if stream_active:
                 try:
                     ljm.eStreamStop(handle)

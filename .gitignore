@@ -1,8 +1,12 @@
 __pycache__/
 .venv/
-logs/
+Run_*/
 position_calibration.json
+pressure_calibration.json
+temperature_calibration.json
 cycle_stops.json
+run_output.json
+auto_archive.json
 *.py[cod]
 .pytest_cache/
 build/
