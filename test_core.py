@@ -179,7 +179,7 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertGreater(float(result["high_voltage"]), 0.96)
         self.assertGreaterEqual(int(result["rejected_count"]), 20)
 
-    def test_invalid_cycle_capture_keeps_count_row_but_omits_motion_metrics(self) -> None:
+    def test_stream_gap_marks_cycle_without_discarding_motion_metrics(self) -> None:
         capture = CycleCapture(
             reset_stop_reached_at="2026-11-11T10:00:00",
             reset_stop_monotonic=10.0,
@@ -188,7 +188,7 @@ class CoreSafetyTests(unittest.TestCase):
             direction=1,
         )
         capture.observe(20.0, 50.0, "2026-11-11T10:00:01", 11.0)
-        self.assertTrue(capture.invalidate("AIN2 left calibrated span; motion metrics unavailable"))
+        capture.stream_gap_detected = True
         values = capture.completed_values(
             completed_at="2026-11-11T10:00:02",
             completed_monotonic=12.0,
@@ -198,9 +198,9 @@ class CoreSafetyTests(unittest.TestCase):
         )
         self.assertEqual(values["cycle_number"], 7)
         self.assertEqual(values["reset_to_count_duration_seconds"], 2.0)
-        self.assertEqual(values["bushing_peak_velocity"], "")
-        self.assertEqual(values["bushing_velocity_sample_count"], 0)
-        self.assertIn("AIN2 left calibrated span", str(values["bushing_data_quality"]))
+        self.assertEqual(values["bushing_peak_velocity"], 50.0)
+        self.assertEqual(values["bushing_velocity_sample_count"], 1)
+        self.assertIn("AIN2 stream gap", str(values["bushing_data_quality"]))
 
     def test_grease_response_uses_1500_psi_threshold(self) -> None:
         event = GreaseEventCapture(
@@ -260,7 +260,8 @@ class CoreSafetyTests(unittest.TestCase):
             count_stop_degrees=25.0,
             direction=1,
         )
-        capture.invalidate("AIN2 left calibrated span; motion metrics unavailable")
+        capture.stream_gap_detected = True
+        capture.observe(20.0, 50.0, "2026-11-11T10:00:01", 11.0)
         logger.log_cycle(
             capture.completed_values(
                 completed_at="2026-11-11T10:00:02",
@@ -284,7 +285,7 @@ class CoreSafetyTests(unittest.TestCase):
         )
         grease.record_pressure(1500.0, "2026-11-11T10:00:02.200", 12.2)
         logger.log_grease_event(grease.values(status="complete"), run_id)
-        logger.log_event("Cycle metrics unavailable", "AIN2 left calibrated span", cycles=7, live_run_id=run_id)
+        logger.log_event("AIN2 stream gap", "Cycle metrics were retained and flagged.", cycles=7, live_run_id=run_id)
         logger.finish_live_run(run_id, status="saved", completed_cycles=7, cycle_frequency_cpm=18.0)
         logger.finalize(active_test_seconds=2.0, completed_cycles=7, cycle_frequency_cpm=18.0)
         logger.close()
@@ -298,40 +299,32 @@ class CoreSafetyTests(unittest.TestCase):
         manifest = json.loads((logger.folder / "run_manifest.json").read_text(encoding="utf-8"))
 
         self.assertEqual([row["cycle_number"] for row in cycles], ["7"])
-        self.assertIn("AIN2 left calibrated span", cycles[0]["bushing_data_quality"])
+        self.assertIn("AIN2 stream gap", cycles[0]["bushing_data_quality"])
         self.assertEqual([row["grease_event_id"] for row in grease_events], ["grease_001"])
-        self.assertEqual([row["event"] for row in events], ["Cycle metrics unavailable"])
+        self.assertEqual([row["event"] for row in events], ["AIN2 stream gap"])
         self.assertEqual(manifest["status"], "completed")
         self.assertEqual(manifest["completed_cycles"], 7)
         self.assertFalse((logger.folder / "stream_trace.csv").exists())
 
-    def test_pressure_calibration_interpolates_and_flags_outside_span(self) -> None:
+    def test_pressure_calibration_interpolates_without_range_rejection(self) -> None:
         calibration = {
             "point_1": {"voltage": 0.5, "pressure_psi": 0.0},
             "point_2": {"voltage": 2.0, "pressure_psi": 3000.0},
         }
-        pressure, outside = TestStandApp.pressure_from_voltage(1.25, calibration)
+        pressure = TestStandApp.pressure_from_voltage(1.25, calibration)
         self.assertEqual(pressure, 1500.0)
-        self.assertFalse(outside)
-        # One fifth of the 1.5 V calibration span is still displayed, so
-        # ordinary endpoint noise does not make pressure blink out.
-        _pressure, outside = TestStandApp.pressure_from_voltage(2.3, calibration)
-        self.assertFalse(outside)
-        _pressure, outside = TestStandApp.pressure_from_voltage(2.31, calibration)
-        self.assertTrue(outside)
+        self.assertEqual(TestStandApp.pressure_from_voltage(2.5, calibration), 4000.0)
 
-    def test_position_calibration_keeps_a_bounded_endpoint_margin_for_velocity(self) -> None:
+    def test_position_calibration_maps_live_motion_beyond_captured_endpoints(self) -> None:
         calibration = {
             "point_1": {"voltage": 0.5, "angle": 0.0},
             "point_2": {"voltage": 2.0, "angle": 90.0},
         }
-        # A 10% voltage-span margin avoids discarding normal mechanical-stop
-        # overshoot from velocity and completed-cycle metrics.
-        angle, outside = TestStandApp.angle_from_voltage(0.4, calibration)
+        # A valid AIN2 stream continues to provide meaningful motion data when
+        # a dynamic calibration capture misses an instantaneous endpoint.
+        angle = TestStandApp.angle_from_voltage(0.4, calibration)
         self.assertAlmostEqual(angle, -6.0)
-        self.assertFalse(outside)
-        _angle, outside = TestStandApp.angle_from_voltage(0.34, calibration)
-        self.assertTrue(outside)
+        self.assertAlmostEqual(TestStandApp.angle_from_voltage(2.75, calibration), 135.0)
 
     def test_shared_stream_samples_remain_separate_from_ain2(self) -> None:
         samples = demultiplex_stream_scans([1.0, 2.0, 3.0, 4.0, 1.5, 1.1, -9999.0, 3.1, 4.1, 1.6])

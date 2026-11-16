@@ -41,7 +41,7 @@ from labjack_diagnostic import (
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 1500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -60,16 +60,7 @@ VELOCITY_ZERO_DEADBAND_DPS = 0.25
 DEFAULT_VELOCITY_GRAPH_LIMIT_DPS = 100.0
 CYCLE_MID_STROKE_FRACTION = 0.05
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
-# The endpoint values from a full-travel capture can differ slightly from the
-# live potentiometer signal at a mechanical stop. Keep a small, bounded margin
-# on both sides so normal endpoint overshoot still supplies velocity and cycle
-# metrics; readings farther away remain invalid.
-POSITION_CALIBRATION_EXTRAPOLATION_FRACTION = 0.10
 MIN_PRESSURE_CALIBRATION_VOLTAGE_SPAN = 0.020
-# A gauge may be captured at its practical pressure limit while normal analog
-# noise still crosses that voltage slightly. Retain a bounded extrapolation
-# band rather than making the live pressure readout blink at the endpoints.
-PRESSURE_CALIBRATION_EXTRAPOLATION_FRACTION = 0.20
 MIN_CYCLE_STOP_SEPARATION_DEGREES = 1.0
 CALIBRATION_STREAM_SAMPLE_COUNT = 100
 POSITION_RANGE_CAPTURE_SECONDS = 10.0
@@ -87,15 +78,12 @@ TEMPERATURE_PLAUSIBLE_MIN_F = -40.0
 TEMPERATURE_PLAUSIBLE_MAX_F = 400.0
 SENSOR_FAULT_ACTIVATION_BATCHES = 2
 SENSOR_FAULT_CLEAR_BATCHES = 3
-# When more than one alarm is active, put a connection or stream continuity
-# fault ahead of calibration-range warnings in the persistent banner.
+# When more than one alarm is active, put motion-stream continuity first.
 FAULT_DISPLAY_ORDER = (
     "labjack_connection",
     "ain2_stream_gap",
     "temperature_1_input",
     "temperature_2_input",
-    "position_range",
-    "pressure_range",
 )
 LABJACK_LJM_WINDOWS_URL = "https://support.labjack.com/docs/ljm-software-installer-windows"
 GITHUB_RELEASES_URL = "https://github.com/leonardx548/Senior-Design/releases/latest"
@@ -255,18 +243,8 @@ class CycleCapture:
     peak_signed_velocity: float | None = None
     mid_stroke_velocities: list[float] = field(default_factory=list)
     grease_event_ids: list[str] = field(default_factory=list)
-    invalid_reason: str | None = None
-
-    def invalidate(self, reason: str) -> bool:
-        """Keep the cycle record but prevent invalid motion metrics from being exported."""
-        if self.invalid_reason is not None:
-            return False
-        self.invalid_reason = reason
-        return True
 
     def observe(self, angle: float, velocity: float | None, sample_at: str, sample_monotonic: float) -> None:
-        if self.invalid_reason is not None:
-            return
         if velocity is not None and (self.peak_velocity is None or abs(velocity) > self.peak_velocity):
             self.peak_velocity = abs(velocity)
             self.peak_signed_velocity = velocity
@@ -296,36 +274,33 @@ class CycleCapture:
         frequency: float,
     ) -> dict[str, float | int | str]:
         quality: list[str] = []
-        metrics_available = self.invalid_reason is None
-        if self.invalid_reason:
-            quality.append(self.invalid_reason)
         if self.stream_gap_detected:
             quality.append("AIN2 stream gap")
-        if metrics_available and not self.mid_stroke_velocities:
+        if not self.mid_stroke_velocities:
             quality.append("mid-stroke velocity unavailable")
-        if metrics_available and (self.motion_started_monotonic is None or self.near_count_stop_monotonic is None):
+        if self.motion_started_monotonic is None or self.near_count_stop_monotonic is None:
             quality.append("mid-stroke timing unavailable")
         return {
             "completed_at": completed_at,
             "cycle_number": cycle_number,
             "live_run_cycle_number": live_run_cycle_number,
             "reset_stop_reached_at": self.reset_stop_reached_at,
-            "motion_started_at": self.motion_started_at if metrics_available and self.motion_started_at else "",
+            "motion_started_at": self.motion_started_at or "",
             "count_stop_reached_at": completed_at,
             "reset_to_count_duration_seconds": round(completed_monotonic - self.reset_stop_monotonic, 4),
             "mid_stroke_duration_seconds": (
-                "" if not metrics_available or self.motion_started_monotonic is None or self.near_count_stop_monotonic is None
+                "" if self.motion_started_monotonic is None or self.near_count_stop_monotonic is None
                 else round(self.near_count_stop_monotonic - self.motion_started_monotonic, 4)
             ),
             "travel_direction": "increasing angle" if self.direction > 0 else "decreasing angle",
             "reset_stop_degrees": round(self.reset_stop_degrees, 4),
             "count_stop_degrees": round(self.count_stop_degrees, 4),
-            "bushing_peak_velocity": "" if not metrics_available or self.peak_velocity is None else round(self.peak_velocity, 4),
-            "bushing_peak_signed_velocity": "" if not metrics_available or self.peak_signed_velocity is None else round(self.peak_signed_velocity, 4),
+            "bushing_peak_velocity": "" if self.peak_velocity is None else round(self.peak_velocity, 4),
+            "bushing_peak_signed_velocity": "" if self.peak_signed_velocity is None else round(self.peak_signed_velocity, 4),
             "bushing_median_travel_velocity": (
-                "" if not metrics_available or not self.mid_stroke_velocities else round(statistics.median(self.mid_stroke_velocities), 4)
+                "" if not self.mid_stroke_velocities else round(statistics.median(self.mid_stroke_velocities), 4)
             ),
-            "bushing_velocity_sample_count": len(self.mid_stroke_velocities) if metrics_available else 0,
+            "bushing_velocity_sample_count": len(self.mid_stroke_velocities),
             "grease_event_ids": ";".join(self.grease_event_ids),
             # These are deliberately blank until physical temperature inputs exist.
             "temp_1": "",
@@ -3049,8 +3024,6 @@ class TestStandApp(tk.Tk):
             return False
 
         self.bushing_unit = "degrees" if self.position_calibration else "volts"
-        self._remove_fault("position_range")
-        self._remove_fault("pressure_range")
         self._remove_fault("temperature_1_input")
         self._remove_fault("temperature_2_input")
         self.configure_bushing_plot()
@@ -3075,7 +3048,6 @@ class TestStandApp(tk.Tk):
             "app_version": APP_VERSION,
             "data_model": {
                 "primary_record": "one summary row per completed cycle",
-                "position_calibration_extrapolation_fraction": POSITION_CALIBRATION_EXTRAPOLATION_FRACTION,
                 "dashboard_snapshot_log": False,
                 "grease_response_threshold_psi": INJECTOR_ACTIVATION_PSI,
                 "grease_comparison_cycles": GREASE_COMPARISON_CYCLE_COUNT,
@@ -3324,7 +3296,6 @@ class TestStandApp(tk.Tk):
         self.paths.write_config("position_calibration.json", calibration)
         self.position_calibration = calibration
         self.bushing_unit = "degrees"
-        self._remove_fault("position_range")
         self.configure_bushing_plot()
         self.configure_velocity_plot()
         self._cycle_capture = None
@@ -3339,7 +3310,6 @@ class TestStandApp(tk.Tk):
         self.paths.remove_config("position_calibration.json")
         self.position_calibration = None
         self.bushing_unit = "volts"
-        self._remove_fault("position_range")
         self.configure_bushing_plot()
         self.configure_velocity_plot()
         self._cycle_capture = None
@@ -3370,7 +3340,6 @@ class TestStandApp(tk.Tk):
         self.pressure_calibration = calibration
         self._display_pressure_voltage_samples.clear()
         self.grease_pressure = None
-        self._remove_fault("pressure_range")
         self.metric_vars["pressure"].set("— psi")
         self.pressure_detail_var.set("Waiting for AIN4")
         self.configure_pressure_plot()
@@ -3385,7 +3354,6 @@ class TestStandApp(tk.Tk):
         self.pressure_calibration = None
         self._display_pressure_voltage_samples.clear()
         self.grease_pressure = None
-        self._remove_fault("pressure_range")
         self.metric_vars["pressure"].set("— psi")
         self.pressure_detail_var.set("Input not configured")
         self.configure_pressure_plot()
@@ -3497,30 +3465,24 @@ class TestStandApp(tk.Tk):
         return True
 
     @staticmethod
-    def angle_from_voltage(voltage: float, calibration: dict[str, object]) -> tuple[float, bool]:
+    def angle_from_voltage(voltage: float, calibration: dict[str, object]) -> float:
         first = calibration["point_1"]
         second = calibration["point_2"]
         first_voltage, second_voltage = float(first["voltage"]), float(second["voltage"])
         first_angle, second_angle = float(first["angle"]), float(second["angle"])
         fraction = (voltage - first_voltage) / (second_voltage - first_voltage)
         angle = first_angle + fraction * (second_angle - first_angle)
-        span = abs(second_voltage - first_voltage)
-        extension = span * POSITION_CALIBRATION_EXTRAPOLATION_FRACTION
-        outside = voltage < min(first_voltage, second_voltage) - extension or voltage > max(first_voltage, second_voltage) + extension
-        return angle, outside
+        return angle
 
     @staticmethod
-    def pressure_from_voltage(voltage: float, calibration: dict[str, object]) -> tuple[float, bool]:
+    def pressure_from_voltage(voltage: float, calibration: dict[str, object]) -> float:
         first = calibration["point_1"]
         second = calibration["point_2"]
         first_voltage, second_voltage = float(first["voltage"]), float(second["voltage"])
         first_pressure, second_pressure = float(first["pressure_psi"]), float(second["pressure_psi"])
         fraction = (voltage - first_voltage) / (second_voltage - first_voltage)
         pressure = first_pressure + fraction * (second_pressure - first_pressure)
-        span = abs(second_voltage - first_voltage)
-        extension = span * PRESSURE_CALIBRATION_EXTRAPOLATION_FRACTION
-        outside = voltage < min(first_voltage, second_voltage) - extension or voltage > max(first_voltage, second_voltage) + extension
-        return pressure, outside
+        return pressure
 
     def configure_pressure_plot(self, clear_samples: bool = True) -> None:
         """Scale the grease-pressure plot around the saved FIO4 gauge calibration."""
@@ -3635,11 +3597,6 @@ class TestStandApp(tk.Tk):
             self.log_event("Partial cycle discarded", reason)
         self._cycle_capture = None
 
-    def _invalidate_cycle_capture(self, reason: str) -> None:
-        """Retain a counted stroke while explicitly withholding invalid motion metrics."""
-        if self._cycle_capture is not None and self._cycle_capture.invalidate(reason):
-            self.log_event("Cycle metrics unavailable", reason)
-
     @staticmethod
     def _grease_event_status(event: GreaseEventCapture, completion: str) -> str:
         baseline_note = "" if len(event.pre_cycles) == GREASE_COMPARISON_CYCLE_COUNT else (
@@ -3660,8 +3617,8 @@ class TestStandApp(tk.Tk):
         self._pending_grease_events.clear()
 
     def _add_cycle_to_grease_comparisons(self, values: dict[str, float | int | str]) -> None:
-        # A cycle whose bushing capture left its calibrated span is retained in
-        # cycle_summary.csv, but it cannot support a valid grease comparison.
+        # A cycle with an actual AIN2 stream discontinuity is retained in the
+        # summary, but it cannot support a continuous grease comparison.
         if values.get("bushing_data_quality") != "complete":
             return
         self._recent_cycle_summaries.append(values)
@@ -3863,27 +3820,23 @@ class TestStandApp(tk.Tk):
         # from the snapshot data.
         self._latest_display_sample_monotonic = sample_monotonic
         if self.position_calibration:
-            angle, outside = self.angle_from_voltage(voltage, self.position_calibration)
-            if not outside:
-                self._update_bushing_velocity(angle, scan_rate_hz)
-                self._record_snapshot_sample(sample_at, sample_monotonic, scan_rate_hz, voltage, angle)
-                self._update_cycle_count_from_bushing(angle, sample_at, sample_monotonic)
-            else:
-                self._velocity_angles.clear()
-                self.bushing_velocity = 0.0
-                self.metric_vars["velocity"].set("+0.00 °/s")
-                self.velocity_detail_var.set("Outside calibrated AIN2 span")
-                self._invalidate_cycle_capture("AIN2 left calibrated span; motion metrics unavailable")
+            # A valid stream sample remains useful beyond the captured endpoint
+            # range. The calibration is linear, so retain it for motion data
+            # rather than discarding an entire cycle on a brief excursion.
+            angle = self.angle_from_voltage(voltage, self.position_calibration)
+            self._update_bushing_velocity(angle, scan_rate_hz)
+            self._record_snapshot_sample(sample_at, sample_monotonic, scan_rate_hz, voltage, angle)
+            self._update_cycle_count_from_bushing(angle, sample_at, sample_monotonic)
 
     def _process_pressure_voltage(self, voltage: float, sample_at: str, sample_monotonic: float) -> None:
         """Process every valid AIN4 sample without redrawing the UI at stream rate."""
         self._display_pressure_voltage_samples.append(voltage)
         if not self.pressure_calibration:
             return
-        pressure, outside = self.pressure_from_voltage(voltage, self.pressure_calibration)
-        if not outside and math.isfinite(pressure) and pressure >= 0:
+        pressure = self.pressure_from_voltage(voltage, self.pressure_calibration)
+        if math.isfinite(pressure):
             self.record_grease_pressure(
-                pressure,
+                max(0.0, pressure),
                 sample_at=sample_at,
                 sample_monotonic=sample_monotonic,
                 render=False,
@@ -3896,44 +3849,24 @@ class TestStandApp(tk.Tk):
             self.metric_vars["pressure"].set("— psi")
             self.pressure_detail_var.set(f"AIN4: {voltage:.4f} V • calibration required")
             return
-        pressure, outside = self.pressure_from_voltage(voltage, self.pressure_calibration)
-        if outside or not math.isfinite(pressure) or pressure < 0:
+        pressure = self.pressure_from_voltage(voltage, self.pressure_calibration)
+        if not math.isfinite(pressure):
             self.metric_vars["pressure"].set("— psi")
-            self.pressure_detail_var.set(f"AIN4: {voltage:.4f} V • OUT")
-            self._observe_fault(
-                "pressure_range",
-                "Pressure input outside calibration range",
-                "AIN4 is outside the saved pressure calibration margin; this reading is not used for grease response data.",
-                True,
-            )
+            self.pressure_detail_var.set(f"AIN4: {voltage:.4f} V")
             return
+        pressure = max(0.0, pressure)
         self.metric_vars["pressure"].set(f"{pressure:,.0f} psi")
         self.pressure_detail_var.set("")
         self.pressure_plot.add(pressure, self._latest_display_sample_monotonic)
-        self._observe_fault(
-            "pressure_range",
-            "Pressure input outside calibration range",
-            "AIN4 readings have recovered.",
-            False,
-        )
 
     def _render_live_bushing_position(self, voltage: float) -> None:
         """Render a short display-only average without affecting cycle detection."""
         self.ain2_voltage = voltage
         if self.position_calibration:
-            angle, outside = self.angle_from_voltage(voltage, self.position_calibration)
+            angle = self.angle_from_voltage(voltage, self.position_calibration)
             self.bushing_position, self.bushing_unit = angle, "degrees"
             self.metric_vars["position"].set(f"{angle:.2f} °")
-            detail = f"AIN2: {voltage:.4f} V"
-            if outside:
-                detail += " • OUT"
-            self.bushing_detail_var.set(detail)
-            self._observe_fault(
-                "position_range",
-                "AIN2 position outside calibration range",
-                "AIN2 is beyond the saved calibration margin; velocity and cycle metrics are unavailable until it returns.",
-                outside,
-            )
+            self.bushing_detail_var.set(f"AIN2: {voltage:.4f} V")
             if not self.graphs_paused:
                 self.bushing_plot.add(angle, self._latest_display_sample_monotonic)
         else:
