@@ -21,12 +21,10 @@ from queue import Empty, Queue
 from typing import Any
 
 
-AIN2_SAMPLE_COUNT = 25
-AIN2_SAMPLE_INTERVAL_SECONDS = 0.02
 LIVE_AIN2_STREAM_RATE_HZ = 200
 LIVE_AIN2_STREAM_SCANS_PER_READ = 10
-# AIN2 remains the motion-critical input. AIN0/AIN1 support the raw
-# temperature-wiring check, while FIO4 (AIN4) is the low-voltage grease
+# AIN2 remains the motion-critical input. AIN0/AIN1 support the Type T
+# temperature inputs, while FIO4 (AIN4) is the low-voltage grease
 # pressure input. Keeping all five on the same hardware stream avoids
 # competing LabJack connections and keeps cycle counting uninterrupted.
 # AIN14 is the T4's internal temperature-sensor voltage.  It must be included
@@ -148,53 +146,6 @@ def summarize_voltage_samples(samples: list[float], channel_name: str = "input")
     }
 
 
-def summarize_ain2_samples(samples: list[float]) -> dict[str, Any]:
-    """Compatibility wrapper for the established position-calibration path."""
-    return summarize_voltage_samples(samples, "AIN2")
-
-
-def ain2_sample_result(ljm: Any, handle: int, count: int, interval_seconds: float) -> dict[str, Any]:
-    """Return a robust short AIN2 sample burst from an already-open T4 handle."""
-    samples: list[float] = []
-    for index in range(count):
-        samples.append(float(ljm.eReadName(handle, "AIN2")))
-        if index < count - 1:
-            time.sleep(interval_seconds)
-    return summarize_ain2_samples(samples)
-
-
-def sample_ain2() -> int:
-    """Capture a calibration-quality AIN2 burst without changing T4 settings."""
-    handle = None
-    try:
-        if not find_t4_in_windows():
-            print(json.dumps({"status": "disconnected", "error": "Windows PnP did not find a connected LabJack T4 on USB."}))
-            return 2
-        from labjack import ljm
-
-        handle = ljm.openS("T4", "USB", "ANY")
-        ljm.eWriteNames(
-            handle,
-            2,
-            ["AIN2_RESOLUTION_INDEX", "AIN2_SETTLING_US"],
-            [AIN2_RESOLUTION_INDEX, AIN2_SETTLING_US],
-        )
-        # Give the newly opened command-response path a brief settle period.
-        time.sleep(0.10)
-        result = ain2_sample_result(ljm, handle, AIN2_SAMPLE_COUNT, AIN2_SAMPLE_INTERVAL_SECONDS)
-        print(json.dumps(result))
-        return 0 if result["stable"] else 2
-    except Exception as error:
-        print(json.dumps({"status": "error", "error": f"{type(error).__name__}: {error}"}))
-        return 1
-    finally:
-        if handle is not None:
-            try:
-                ljm.close(handle)
-            except Exception:
-                pass
-
-
 def demultiplex_stream_scans(stream_data: list[float], channels: tuple[str, ...] = LIVE_STREAM_CHANNELS) -> dict[str, list[float]]:
     """Split interleaved LJM stream scans into valid samples for each input.
 
@@ -219,30 +170,6 @@ def demultiplex_stream_scans(stream_data: list[float], channels: tuple[str, ...]
             if value != -9999.0:
                 values[channel].append(value)
     return values
-
-
-def auxiliary_stream_scans(stream_data: list[float]) -> list[tuple[float | None, float | None]]:
-    """Return every AIN0/AIN1 scan, retaining invalid values as ``None``.
-
-    Unlike the compatibility sample lists, this preserves one row per hardware
-    scan.  The raw-input capture can therefore show missing readings instead of
-    silently closing a gap in time.
-    """
-    scans: list[tuple[float | None, float | None]] = []
-    channel_count = len(LIVE_STREAM_CHANNELS)
-    for offset in range(0, len(stream_data), channel_count):
-        scan = stream_data[offset:offset + channel_count]
-        if len(scan) != channel_count:
-            continue
-        values: list[float | None] = []
-        for raw_value in scan[:2]:
-            try:
-                value = float(raw_value)
-            except (TypeError, ValueError):
-                value = -9999.0
-            values.append(None if value == -9999.0 else value)
-        scans.append((values[0], values[1]))
-    return scans
 
 
 def ps12dc_output_request(command_text: str) -> bool | None:
@@ -360,11 +287,11 @@ def stream_ain2() -> int:
                 if stop_requested.is_set():
                     break
                 channel_samples = demultiplex_stream_scans(stream_data)
-                raw_auxiliary_scans = auxiliary_stream_scans(stream_data)
                 # The dashboard's existing motion path reads ``samples``. Keep
                 # that name as an AIN2-only compatibility field.
                 samples = channel_samples["AIN2"]
-                skipped_samples = len(raw_auxiliary_scans) - len(samples)
+                scan_count = len(stream_data) // len(LIVE_STREAM_CHANNELS)
+                skipped_samples = scan_count - len(samples)
                 # The dashboard may briefly be busy drawing or opening a dialog.
                 # Stamp this batch here, beside eStreamRead, so a queued batch
                 # keeps its true position on the time axis instead of being
@@ -378,7 +305,6 @@ def stream_ain2() -> int:
                     "ain1_samples": channel_samples["AIN1"],
                     "ain4_samples": channel_samples["AIN4"],
                     "ain14_samples": channel_samples["AIN14"],
-                    "auxiliary_scans": raw_auxiliary_scans,
                     "scan_rate_hz": actual_scan_rate,
                     "skipped_samples": skipped_samples,
                     "device_backlog": device_backlog,
@@ -488,8 +414,6 @@ def build_report() -> dict[str, Any]:
 def main() -> int:
     if "--child-probe" in sys.argv:
         return child_probe()
-    if "--sample-ain2" in sys.argv:
-        return sample_ain2()
     if "--stream-ain2" in sys.argv:
         return stream_ain2()
 

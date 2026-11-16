@@ -38,11 +38,12 @@ copy /y "RELEASE_README.txt" "dist\TestStand\START_HERE.txt" >nul
 copy /y "Verify LabJack.bat" "dist\TestStand\Verify LabJack.bat" >nul
 copy /y "Install LabJack Driver.url" "dist\TestStand\Install LabJack Driver.url" >nul
 mkdir release
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\TestStand\*' -DestinationPath 'release\SeniorDesignTestStand-v0.4.1-windows.zip' -Force"
+%PYTHON_CMD% -c "from pathlib import Path; import shutil; source = Path('dist/TestStand'); target = Path('release/SeniorDesignTestStand-v0.4.2-windows.zip'); shutil.make_archive(str(target.with_suffix('')), 'zip', root_dir=source)"
+if errorlevel 1 goto :failed
 
 echo.
 echo Release package created:
-echo   release\SeniorDesignTestStand-v0.4.1-windows.zip
+echo   release\SeniorDesignTestStand-v0.4.2-windows.zip
 pause
 exit /b 0
 

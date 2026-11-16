@@ -9,15 +9,13 @@ import unittest
 import zipfile
 import os
 from collections import deque
-from datetime import datetime, timedelta
 from pathlib import Path
 
-from app_storage import AppPaths, CsvLogger
+from app_storage import AppPaths, Campaign, CsvLogger
 from labjack_diagnostic import (
-    auxiliary_stream_scans,
     demultiplex_stream_scans,
     ps12dc_output_request,
-    summarize_ain2_samples,
+    summarize_voltage_samples,
     t4_device_temperature_celsius_from_ain14,
     t4_usb_air_temperature_celsius_from_ain14,
 )
@@ -27,11 +25,15 @@ from test_stand_app import (
     INJECTOR_ACTIVATION_PSI,
     TestStandApp,
     LivePlot,
+    summarize_temperature_fahrenheit_samples,
     temperature_from_amplified_voltage,
     type_t_emf_millivolts,
     type_t_temperature_celsius,
     summarize_ain2_travel_range,
-    write_live_run_archive,
+    import_campaign_package,
+    read_calibration_package,
+    write_campaign_package,
+    write_calibration_package,
 )
 
 
@@ -50,36 +52,6 @@ class CoreSafetyTests(unittest.TestCase):
         else:
             os.environ["SENIOR_DESIGN_DATA_DIR"] = self.previous_data_directory
 
-    def test_archive_is_verified_and_contains_selected_run(self) -> None:
-        logs = self.temporary_directory / "logs"
-        logs.mkdir()
-        logger = CsvLogger(logs)
-        run = logger.begin_live_run({"test": "configuration"}, completed_cycles_at_start=0)
-        run_id = str(run["id"])
-        logger.log_event("Test event", "Archive regression check", cycles=0, live_run_id=run_id)
-        logger.finish_live_run(run_id, status="stopped", completed_cycles=0, cycle_frequency_cpm=0.0)
-        logger.close()
-
-        exports = self.temporary_directory / "exports"
-        exports.mkdir()
-        destination = exports / "run.zip"
-        count = write_live_run_archive(
-            destination,
-            [(logger.folder, CsvLogger.read_live_runs(logger.folder)[0])],
-            {"cycles", "grease", "events", "metadata", "configuration"},
-        )
-
-        self.assertEqual(count, 6)  # export manifest plus five compact run files
-        with zipfile.ZipFile(destination) as archive:
-            self.assertIsNone(archive.testzip())
-            names = set(archive.namelist())
-        self.assertIn("export_manifest.json", names)
-        self.assertIn(f"{logger.folder.name}/{run_id}/cycle_summary.csv", names)
-        self.assertIn(f"{logger.folder.name}/{run_id}/grease_events.csv", names)
-        self.assertIn(f"{logger.folder.name}/{run_id}/events.csv", names)
-        self.assertIn(f"{logger.folder.name}/{run_id}/live_run.json", names)
-        self.assertIn(f"{logger.folder.name}/{run_id}/run_configuration.json", names)
-
     def test_csv_logger_can_create_a_direct_run_folder(self) -> None:
         output_root = self.temporary_directory / "chosen_output"
         logger = CsvLogger(output_root)
@@ -87,14 +59,114 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertTrue(logger.folder.name.startswith("Run_"))
         logger.close()
 
+    def test_campaign_retains_total_across_multiple_dated_runs(self) -> None:
+        output_root = self.temporary_directory / "campaign_output"
+        campaign = Campaign.create(output_root, "Lubrication endurance")
+        self.assertEqual(campaign.completed_cycles, 0)
+        self.assertTrue(campaign.runs_root.is_dir())
+
+        first_logger = CsvLogger(campaign.runs_root)
+        first_session = campaign.begin_session(first_logger.folder, completed_cycles_at_start=0)
+        campaign.record_progress(42, 125.4)
+        campaign.finish_session(first_session, status="saved", completed_cycles=42, active_test_seconds=125.4)
+        first_logger.close()
+
+        resumed = Campaign.open(campaign.folder)
+        self.assertIsNotNone(resumed)
+        assert resumed is not None
+        self.assertEqual(resumed.completed_cycles, 42)
+        self.assertAlmostEqual(resumed.active_test_seconds, 125.4)
+
+        second_logger = CsvLogger(resumed.runs_root)
+        second_session = resumed.begin_session(second_logger.folder, completed_cycles_at_start=resumed.completed_cycles)
+        resumed.finish_session(second_session, status="saved", completed_cycles=59, active_test_seconds=180.0)
+        self.assertEqual(resumed.completed_cycles, 59)
+        self.assertEqual(len(resumed.manifest["sessions"]), 2)
+        second_logger.close()
+
+        resumed.finish()
+        finished = Campaign.open(campaign.folder)
+        self.assertIsNotNone(finished)
+        assert finished is not None
+        self.assertEqual(finished.manifest["status"], "completed")
+
+    def test_campaign_marks_unclosed_session_before_resuming(self) -> None:
+        campaign = Campaign.create(self.temporary_directory, "Interrupted session")
+        first_logger = CsvLogger(campaign.runs_root)
+        campaign.begin_session(first_logger.folder, completed_cycles_at_start=0)
+        first_logger.close()
+
+        resumed = Campaign.open(campaign.folder)
+        self.assertIsNotNone(resumed)
+        assert resumed is not None
+        second_logger = CsvLogger(resumed.runs_root)
+        resumed.begin_session(second_logger.folder, completed_cycles_at_start=0)
+        self.assertEqual(resumed.manifest["sessions"][0]["status"], "interrupted_before_resume")
+        second_logger.close()
+
+    def test_campaign_package_round_trip_preserves_setup_and_runs(self) -> None:
+        source_root = self.temporary_directory / "source"
+        campaign = Campaign.create(source_root, "Team handoff")
+        setup = {
+            "schema_version": 1,
+            "position_calibration": {"point_1": {"voltage": 0.5, "angle": 0.0}},
+            "pressure_calibration": None,
+            "temperature_calibration": None,
+            "cycle_stops": {"retracted": 0.0, "extended": 30.0},
+        }
+        campaign.write_configuration(setup)
+        logger = CsvLogger(campaign.runs_root)
+        run = logger.begin_live_run({}, completed_cycles_at_start=12)
+        session_id = campaign.begin_session(logger.folder, completed_cycles_at_start=12)
+        logger.finish_live_run(str(run["id"]), status="saved", completed_cycles=14, cycle_frequency_cpm=20.0)
+        campaign.finish_session(session_id, status="saved", completed_cycles=14, active_test_seconds=8.5)
+        logger.close()
+
+        package = self.temporary_directory / "handoff.zip"
+        count = write_campaign_package(package, campaign)
+        self.assertGreaterEqual(count, 4)
+        with zipfile.ZipFile(package) as archive:
+            self.assertIsNone(archive.testzip())
+            self.assertIn("campaign_package.json", archive.namelist())
+            self.assertIn(f"{campaign.folder.name}/campaign_configuration.json", archive.namelist())
+
+        destination_root = self.temporary_directory / "destination"
+        imported = import_campaign_package(package, destination_root)
+        self.assertEqual(imported.name, "Team handoff")
+        self.assertEqual(imported.completed_cycles, 14)
+        self.assertEqual(imported.read_configuration(), setup)
+        self.assertEqual(len(list(imported.runs_root.glob("Run_*"))), 1)
+        duplicate = import_campaign_package(package, destination_root)
+        self.assertNotEqual(duplicate.folder, imported.folder)
+        self.assertTrue(duplicate.folder.name.endswith("_02"))
+
+    def test_calibration_package_round_trip_contains_setup_only(self) -> None:
+        setup = {
+            "schema_version": 1,
+            "captured_at": "2026-11-13T10:00:00-05:00",
+            "position_calibration": {
+                "point_1": {"voltage": 0.5, "angle": 0.0},
+                "point_2": {"voltage": 2.0, "angle": 90.0},
+            },
+            "pressure_calibration": None,
+            "temperature_calibration": {"mode": "nominal", "cjc_celsius": 22.0, "channels": {}},
+            "cycle_stops": {"retracted": 0.0, "extended": 90.0},
+        }
+        destination = self.temporary_directory / "calibration.zip"
+        self.assertEqual(write_calibration_package(destination, setup), 2)
+        with zipfile.ZipFile(destination) as archive:
+            self.assertIsNone(archive.testzip())
+            self.assertEqual(set(archive.namelist()), {"calibration_package.json", "calibration_setup.json"})
+        self.assertEqual(read_calibration_package(destination), setup)
+
     def test_app_paths_only_create_configuration_storage(self) -> None:
         paths = AppPaths.create(self.temporary_directory)
         self.assertTrue(paths.config.is_dir())
         self.assertFalse((paths.root / "logs").exists())
 
-    def test_ain2_summary_rejects_unstable_samples(self) -> None:
-        stable = summarize_ain2_samples([0.06, 0.061, 0.059, 0.06])
-        unstable = summarize_ain2_samples([0.0, 0.2, 0.0, 0.2])
+    def test_voltage_summary_rejects_unstable_samples(self) -> None:
+        stable = summarize_voltage_samples([0.06, 0.061, 0.059, 0.06], "AIN2")
+        unstable = summarize_voltage_samples([0.0, 0.2, 0.0, 0.2], "AIN2")
         self.assertEqual(stable["status"], "success")
         self.assertEqual(unstable["status"], "unstable")
 
@@ -248,17 +320,26 @@ class CoreSafetyTests(unittest.TestCase):
         _pressure, outside = TestStandApp.pressure_from_voltage(2.31, calibration)
         self.assertTrue(outside)
 
-    def test_auxiliary_stream_samples_remain_separate_from_ain2(self) -> None:
+    def test_position_calibration_keeps_a_bounded_endpoint_margin_for_velocity(self) -> None:
+        calibration = {
+            "point_1": {"voltage": 0.5, "angle": 0.0},
+            "point_2": {"voltage": 2.0, "angle": 90.0},
+        }
+        # A 10% voltage-span margin avoids discarding normal mechanical-stop
+        # overshoot from velocity and completed-cycle metrics.
+        angle, outside = TestStandApp.angle_from_voltage(0.4, calibration)
+        self.assertAlmostEqual(angle, -6.0)
+        self.assertFalse(outside)
+        _angle, outside = TestStandApp.angle_from_voltage(0.34, calibration)
+        self.assertTrue(outside)
+
+    def test_shared_stream_samples_remain_separate_from_ain2(self) -> None:
         samples = demultiplex_stream_scans([1.0, 2.0, 3.0, 4.0, 1.5, 1.1, -9999.0, 3.1, 4.1, 1.6])
         self.assertEqual(samples["AIN0"], [1.0, 1.1])
         self.assertEqual(samples["AIN1"], [2.0])
         self.assertEqual(samples["AIN2"], [3.0, 3.1])
         self.assertEqual(samples["AIN4"], [4.0, 4.1])
         self.assertEqual(samples["AIN14"], [1.5, 1.6])
-
-    def test_auxiliary_capture_rows_keep_invalid_readings_visible(self) -> None:
-        scans = auxiliary_stream_scans([1.0, 2.0, 3.0, 4.0, 1.5, -9999.0, 2.1, 3.1, 4.1, 1.6])
-        self.assertEqual(scans, [(1.0, 2.0), (None, 2.1)])
 
     def test_t4_air_temperature_estimate_uses_usb_offset(self) -> None:
         # 1.5961 V corresponds to 46.65 °C device temperature from the
@@ -272,29 +353,6 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertIsNone(ps12dc_output_request("SET_OUTPUT DIO9 1"))
         self.assertIsNone(ps12dc_output_request("SET_OUTPUT DIO7 1"))
         self.assertIsNone(ps12dc_output_request("SET_OUTPUT DIO8 ON"))
-
-    def test_auxiliary_capture_uses_a_continuous_sample_clock(self) -> None:
-        app = TestStandApp.__new__(TestStandApp)
-        app._raw_auxiliary_samples = deque(maxlen=12020)
-        app._last_auxiliary_capture_monotonic = None
-        app._last_auxiliary_capture_at = None
-        app.auxiliary_raw_voltages = {"AIN0": None, "AIN1": None}
-        initial_at = datetime(2026, 10, 22, 13, 0, 0)
-        app._record_raw_auxiliary_scans([(1.0, 2.0)] * 10, 200.0, 10.0, initial_at, 0, 0)
-        # The next read arrived 155 ms later, but it holds the next ten 5 ms
-        # samples. The saved sample clock must not manufacture a 155 ms gap.
-        app._record_raw_auxiliary_scans(
-            [(1.1, 2.1)] * 10,
-            200.0,
-            10.155,
-            initial_at + timedelta(milliseconds=155),
-            0,
-            30,
-        )
-        samples = tuple(app._raw_auxiliary_samples)
-        intervals = [samples[index].monotonic_seconds - samples[index - 1].monotonic_seconds for index in range(1, len(samples))]
-        self.assertTrue(all(abs(interval - 0.005) < 1e-9 for interval in intervals))
-        self.assertEqual(samples[-1].batch_received_at, (initial_at + timedelta(milliseconds=155)).isoformat(timespec="milliseconds"))
 
     def test_graph_reduction_preserves_time_order_and_extremes(self) -> None:
         samples = tuple((float(index), float(index % 5)) for index in range(1000))
@@ -354,6 +412,52 @@ class CoreSafetyTests(unittest.TestCase):
         # Ten room-temperature Type-T degrees are approximately 405 µV.
         voltage = 1.25 + 201.0 * 40.5e-6 * 10.0
         self.assertAlmostEqual(temperature_from_amplified_voltage(voltage, calibration, "AIN0"), 32.4, places=1)
+
+    def test_temperature_batch_rejects_implausible_open_probe_readings(self) -> None:
+        calibration = {
+            "cjc_celsius": 22.5,
+            "channels": {"AIN0": {"gain": 201.0, "offset_volts": 1.25}},
+        }
+        normal_voltage = 1.25 + 201.0 * 40.5e-6 * 10.0
+        normal_fahrenheit, normal_fault = summarize_temperature_fahrenheit_samples(
+            [normal_voltage] * 10, calibration, "AIN0"
+        )
+        self.assertIsNone(normal_fault)
+        self.assertAlmostEqual(float(normal_fahrenheit), 90.3, places=1)
+
+        open_probe_voltage = 1.25 + 201.0 * (
+            type_t_emf_millivolts(400.0) - type_t_emf_millivolts(22.5)
+        ) / 1000.0
+        open_probe_fahrenheit, open_probe_fault = summarize_temperature_fahrenheit_samples(
+            [open_probe_voltage] * 10, calibration, "AIN0"
+        )
+        self.assertIsNone(open_probe_fahrenheit)
+        self.assertIn("plausible", str(open_probe_fault))
+
+    def test_fault_warning_debounces_and_logs_only_state_changes(self) -> None:
+        app = TestStandApp.__new__(TestStandApp)
+        app._active_faults = {}
+        app._fault_failure_batches = {}
+        app._fault_recovery_batches = {}
+        events: list[tuple[str, str]] = []
+        bells: list[bool] = []
+        app._render_fault_banner = lambda: None
+        app.log_event = lambda event, detail: events.append((event, detail))
+        app.bell = lambda: bells.append(True)
+
+        app._observe_fault("temperature_1_input", "Temperature 1 input fault", "Probe check needed.", True)
+        self.assertNotIn("temperature_1_input", app._active_faults)
+        app._observe_fault("temperature_1_input", "Temperature 1 input fault", "Probe check needed.", True)
+        self.assertIn("temperature_1_input", app._active_faults)
+        self.assertEqual(events, [("ALARM — Temperature 1 input fault", "Probe check needed.")])
+        self.assertEqual(bells, [True])
+
+        app._observe_fault("temperature_1_input", "Temperature 1 input fault", "", False)
+        app._observe_fault("temperature_1_input", "Temperature 1 input fault", "", False)
+        self.assertIn("temperature_1_input", app._active_faults)
+        app._observe_fault("temperature_1_input", "Temperature 1 input fault", "", False)
+        self.assertNotIn("temperature_1_input", app._active_faults)
+        self.assertEqual(events[-1], ("Alarm cleared — Temperature 1 input fault", "Valid readings have recovered."))
 
     def test_cycle_frequency_history_samples_once_per_second(self) -> None:
         app = TestStandApp.__new__(TestStandApp)

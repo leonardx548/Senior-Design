@@ -28,6 +28,9 @@ CONFIG_FILENAMES = (
     "run_output.json",
 )
 LIVE_RUNS_FILENAME = "live_runs.json"
+CAMPAIGN_MANIFEST_FILENAME = "campaign_manifest.json"
+CAMPAIGN_RUNS_DIRECTORY = "runs"
+CAMPAIGN_CONFIGURATION_FILENAME = "campaign_configuration.json"
 
 
 def write_json_atomic(path: Path, values: Any) -> None:
@@ -94,8 +97,170 @@ class AppPaths:
         except FileNotFoundError:
             pass
 
+
+def _campaign_slug(name: str) -> str:
+    """Make a readable, Windows-safe campaign folder suffix."""
+    cleaned = "".join(character if character.isalnum() else "_" for character in name.strip())
+    return "_".join(part for part in cleaned.split("_") if part)[:48] or "Test"
+
+
+@dataclass
+class Campaign:
+    """Durable parent record for one multi-session test campaign."""
+
+    folder: Path
+    manifest: dict[str, Any]
+
+    @property
+    def runs_root(self) -> Path:
+        return self.folder / CAMPAIGN_RUNS_DIRECTORY
+
+    @property
+    def name(self) -> str:
+        return str(self.manifest.get("name", self.folder.name))
+
+    @property
+    def campaign_id(self) -> str:
+        return str(self.manifest.get("campaign_id", self.folder.name))
+
+    @property
+    def completed_cycles(self) -> int:
+        try:
+            return max(0, int(self.manifest.get("completed_cycles", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def active_test_seconds(self) -> float:
+        try:
+            return max(0.0, float(self.manifest.get("active_test_seconds", 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def create(cls, output_root: Path, name: str) -> "Campaign":
+        """Create a user-named campaign; sessions are created only when started."""
+        display_name = name.strip()
+        if not display_name:
+            raise ValueError("Enter a campaign name.")
+        output_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"Campaign_{timestamp}_{_campaign_slug(display_name)}"
+        folder = output_root / base_name
+        suffix = 2
+        while folder.exists():
+            folder = output_root / f"{base_name}_{suffix:02d}"
+            suffix += 1
+        folder.mkdir(parents=True)
+        (folder / CAMPAIGN_RUNS_DIRECTORY).mkdir()
+        created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        manifest: dict[str, Any] = {
+            "schema_version": 1,
+            "campaign_id": folder.name,
+            "name": display_name,
+            "status": "active",
+            "created_at": created_at,
+            "completed_at": None,
+            "completed_cycles": 0,
+            "active_test_seconds": 0.0,
+            "sessions": [],
+        }
+        write_json_atomic(folder / CAMPAIGN_MANIFEST_FILENAME, manifest)
+        return cls(folder=folder, manifest=manifest)
+
+    @classmethod
+    def open(cls, folder: Path) -> "Campaign" | None:
+        try:
+            manifest = json.loads((folder / CAMPAIGN_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                return None
+            if not str(manifest.get("campaign_id", "")).strip():
+                return None
+            return cls(folder=folder, manifest=manifest)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    @classmethod
+    def available(cls, output_root: Path) -> list["Campaign"]:
+        """Return explicit campaign folders newest first; legacy runs are excluded."""
+        try:
+            campaigns = (cls.open(folder) for folder in output_root.glob("Campaign_*") if folder.is_dir())
+            return sorted((campaign for campaign in campaigns if campaign is not None), key=lambda item: item.folder.name, reverse=True)
+        except OSError:
+            return []
+
+    def _save(self) -> None:
+        write_json_atomic(self.folder / CAMPAIGN_MANIFEST_FILENAME, self.manifest)
+
+    def read_configuration(self) -> dict[str, Any] | None:
+        """Return the campaign's portable setup snapshot, if one was saved."""
+        try:
+            values = json.loads((self.folder / CAMPAIGN_CONFIGURATION_FILENAME).read_text(encoding="utf-8"))
+            return values if isinstance(values, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def write_configuration(self, configuration: dict[str, Any]) -> None:
+        """Persist the setup that must travel with this campaign package."""
+        write_json_atomic(self.folder / CAMPAIGN_CONFIGURATION_FILENAME, configuration)
+
+    def begin_session(self, run_folder: Path, completed_cycles_at_start: int) -> str:
+        sessions = self.manifest.setdefault("sessions", [])
+        if not isinstance(sessions, list):
+            sessions = []
+            self.manifest["sessions"] = sessions
+        # A power loss cannot run the normal close handler. Preserve that fact
+        # before opening the next dated run rather than silently treating the
+        # abandoned session as healthy or deleting its durable CSV rows.
+        for session in sessions:
+            if isinstance(session, dict) and session.get("status") == "active":
+                session["status"] = "interrupted_before_resume"
+                session["recovered_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        session_id = f"session_{len(sessions) + 1:03d}"
+        sessions.append(
+            {
+                "id": session_id,
+                "run_folder": run_folder.name,
+                "status": "active",
+                "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "ended_at": None,
+                "completed_cycles_at_start": int(completed_cycles_at_start),
+                "completed_cycles_at_end": None,
+            }
+        )
+        self._save()
+        return session_id
+
+    def record_progress(self, completed_cycles: int, active_test_seconds: float) -> None:
+        """Persist campaign totals after a completed mechanical cycle."""
+        self.manifest["completed_cycles"] = max(0, int(completed_cycles))
+        self.manifest["active_test_seconds"] = max(0.0, round(float(active_test_seconds), 1))
+        self._save()
+
+    def finish_session(self, session_id: str, *, status: str, completed_cycles: int, active_test_seconds: float) -> None:
+        sessions = self.manifest.get("sessions", [])
+        if isinstance(sessions, list):
+            for session in sessions:
+                if isinstance(session, dict) and session.get("id") == session_id:
+                    session.update(
+                        status=status,
+                        ended_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                        completed_cycles_at_end=int(completed_cycles),
+                    )
+                    break
+        self.manifest["completed_cycles"] = max(0, int(completed_cycles))
+        self.manifest["active_test_seconds"] = max(0.0, round(float(active_test_seconds), 1))
+        self._save()
+
+    def finish(self) -> None:
+        self.manifest.update(
+            status="completed",
+            completed_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        self._save()
+
 class CsvLogger:
-    """Keeps one durable test round in one direct-output folder."""
+    """Keeps one durable dated test run in its own folder."""
 
     def __init__(self, output_root: Path) -> None:
         output_root.mkdir(parents=True, exist_ok=True)
@@ -182,12 +347,8 @@ class CsvLogger:
         })
         self._write_live_runs([])
 
-    @staticmethod
-    def _write_json_atomic(path: Path, values: Any) -> None:
-        write_json_atomic(path, values)
-
     def _write_manifest(self, values: dict[str, Any]) -> None:
-        self._write_json_atomic(self.manifest_path, values)
+        write_json_atomic(self.manifest_path, values)
 
     def update_manifest(self, **values: Any) -> None:
         try:
@@ -200,7 +361,7 @@ class CsvLogger:
     def write_run_configuration(self, values: dict[str, Any]) -> None:
         """Snapshot settings used by this run, independent of later edits."""
         target = self.folder / "run_configuration.json"
-        self._write_json_atomic(target, values)
+        write_json_atomic(target, values)
 
     @staticmethod
     def read_live_runs(folder: Path) -> list[dict[str, Any]]:
@@ -211,23 +372,14 @@ class CsvLogger:
         except (OSError, ValueError, json.JSONDecodeError):
             return []
 
-    @staticmethod
-    def read_run_manifest(folder: Path) -> dict[str, Any]:
-        """Read the application-session metadata used by Local Data management."""
-        try:
-            values = json.loads((folder / "run_manifest.json").read_text(encoding="utf-8"))
-            return values if isinstance(values, dict) else {}
-        except (OSError, ValueError, json.JSONDecodeError):
-            return {}
-
     def _live_runs(self) -> list[dict[str, Any]]:
         return self.read_live_runs(self.folder)
 
     def _write_live_runs(self, runs: list[dict[str, Any]]) -> None:
-        self._write_json_atomic(self.live_runs_path, runs)
+        write_json_atomic(self.live_runs_path, runs)
 
     def begin_live_run(self, configuration: dict[str, Any], completed_cycles_at_start: int) -> dict[str, Any]:
-        """Initialize the single test round recorded in this output folder."""
+        """Initialize the single logical run recorded in this dated folder."""
         runs = self._live_runs()
         run = {
             "schema_version": 2,
@@ -238,13 +390,20 @@ class CsvLogger:
             "completed_cycles_at_start": completed_cycles_at_start,
             "completed_cycles_at_end": None,
             "cycle_frequency_cpm_at_end": None,
-            "exported_at": None,
-            "export_count": 0,
             "configuration": configuration,
         }
         runs.append(run)
         self._write_live_runs(runs)
         return run
+
+    def _update_live_run(self, run_id: str, **values: Any) -> None:
+        """Atomically update one run's compact metadata record."""
+        runs = self._live_runs()
+        for run in runs:
+            if run.get("id") == run_id:
+                run.update(values)
+                break
+        self._write_live_runs(runs)
 
     def finish_live_run(
         self,
@@ -254,30 +413,17 @@ class CsvLogger:
         completed_cycles: int,
         cycle_frequency_cpm: float,
     ) -> None:
-        runs = self._live_runs()
-        for run in runs:
-            if run.get("id") == run_id:
-                run.update(
-                    status=status,
-                    ended_at=datetime.now().astimezone().isoformat(timespec="seconds"),
-                    completed_cycles_at_end=completed_cycles,
-                    cycle_frequency_cpm_at_end=cycle_frequency_cpm,
-                )
-                break
-        self._write_live_runs(runs)
+        self._update_live_run(
+            run_id,
+            status=status,
+            ended_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            completed_cycles_at_end=completed_cycles,
+            cycle_frequency_cpm_at_end=cycle_frequency_cpm,
+        )
 
-    @classmethod
-    def mark_live_runs_exported_in_folder(cls, folder: Path, run_ids: set[str]) -> None:
-        runs = cls.read_live_runs(folder)
-        exported_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        for run in runs:
-            if run.get("id") in run_ids:
-                run["exported_at"] = exported_at
-                run["export_count"] = int(run.get("export_count", 0)) + 1
-        cls._write_json_atomic(folder / LIVE_RUNS_FILENAME, runs)
-
-    def mark_live_runs_exported(self, run_ids: set[str]) -> None:
-        self.mark_live_runs_exported_in_folder(self.folder, run_ids)
+    def update_live_run_configuration(self, run_id: str, configuration: dict[str, Any]) -> None:
+        """Refresh the exported per-run configuration after campaign session creation."""
+        self._update_live_run(run_id, configuration=configuration)
 
     def flush(self) -> None:
         for output in (self.cycle_file, self.grease_file, self.event_file):

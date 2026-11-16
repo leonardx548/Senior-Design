@@ -16,6 +16,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -25,16 +26,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from html import escape as xml_escape
-from io import StringIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from queue import Empty, Queue
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Callable
 
-from app_storage import AppPaths, CsvLogger
+from app_storage import AppPaths, Campaign, CsvLogger
 from labjack_diagnostic import (
-    summarize_ain2_samples,
     summarize_voltage_samples,
     t4_device_temperature_celsius_from_ain14,
     t4_usb_air_temperature_celsius_from_ain14,
@@ -42,7 +41,7 @@ from labjack_diagnostic import (
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 1500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -51,15 +50,21 @@ SNAPSHOT_HISTORY_SECONDS = 15
 SNAPSHOT_REVIEW_SECONDS = 60
 SNAPSHOT_STREAM_RATE_HZ = 200
 SNAPSHOT_HISTORY_MAX_SAMPLES = SNAPSHOT_REVIEW_SECONDS * SNAPSHOT_STREAM_RATE_HZ
-RAW_AUXILIARY_CAPTURE_SECONDS = 60
-RAW_AUXILIARY_HISTORY_MAX_SAMPLES = RAW_AUXILIARY_CAPTURE_SECONDS * SNAPSHOT_STREAM_RATE_HZ + 20
 SNAPSHOT_PAN_STEP_SECONDS = 5
 RUN_OUTPUT_CONFIG_FILENAME = "run_output.json"
+CAMPAIGN_PACKAGE_MANIFEST_FILENAME = "campaign_package.json"
+CALIBRATION_PACKAGE_MANIFEST_FILENAME = "calibration_package.json"
+CALIBRATION_PACKAGE_SETUP_FILENAME = "calibration_setup.json"
 VELOCITY_SLOPE_WINDOW_SAMPLES = 11
 VELOCITY_ZERO_DEADBAND_DPS = 0.25
 DEFAULT_VELOCITY_GRAPH_LIMIT_DPS = 100.0
 CYCLE_MID_STROKE_FRACTION = 0.05
 MIN_CALIBRATION_VOLTAGE_SPAN = 0.050
+# The endpoint values from a full-travel capture can differ slightly from the
+# live potentiometer signal at a mechanical stop. Keep a small, bounded margin
+# on both sides so normal endpoint overshoot still supplies velocity and cycle
+# metrics; readings farther away remain invalid.
+POSITION_CALIBRATION_EXTRAPOLATION_FRACTION = 0.10
 MIN_PRESSURE_CALIBRATION_VOLTAGE_SPAN = 0.020
 # A gauge may be captured at its practical pressure limit while normal analog
 # noise still crosses that voltage slightly. Retain a bounded extrapolation
@@ -75,16 +80,25 @@ TEMPERATURE_NOMINAL_OFFSET_VOLTS = 1.25
 TEMPERATURE_HISTORY_SAMPLE_SECONDS = 1.0
 TYPE_T_MIN_CELSIUS = -200.0
 TYPE_T_MAX_CELSIUS = 400.0
+# These are deliberately narrower than the mathematical Type-T conversion
+# range. A test-stand probe near ambient cannot plausibly jump to the Type-T
+# limit when its wiring opens, so values outside this band are faults, not data.
+TEMPERATURE_PLAUSIBLE_MIN_F = -40.0
+TEMPERATURE_PLAUSIBLE_MAX_F = 400.0
+SENSOR_FAULT_ACTIVATION_BATCHES = 2
+SENSOR_FAULT_CLEAR_BATCHES = 3
+# When more than one alarm is active, put a connection or stream continuity
+# fault ahead of calibration-range warnings in the persistent banner.
+FAULT_DISPLAY_ORDER = (
+    "labjack_connection",
+    "ain2_stream_gap",
+    "temperature_1_input",
+    "temperature_2_input",
+    "position_range",
+    "pressure_range",
+)
 LABJACK_LJM_WINDOWS_URL = "https://support.labjack.com/docs/ljm-software-installer-windows"
 GITHUB_RELEASES_URL = "https://github.com/leonardx548/Senior-Design/releases/latest"
-
-EXPORT_FILE_OPTIONS = (
-    ("cycles", "Cycle summary", "cycle_summary.csv"),
-    ("grease", "Grease events", "grease_events.csv"),
-    ("events", "Event log", "events.csv"),
-    ("metadata", "Run metadata", "live_run.json"),
-    ("configuration", "Run configuration", "run_configuration.json"),
-)
 
 # NIST Monograph 175, Type T reference function coefficients (millivolts). The
 # forward function is relative to a 0 °C reference junction.
@@ -143,6 +157,40 @@ def temperature_from_amplified_voltage(voltage: float, calibration: dict[str, ob
         raise ValueError("Temperature calibration has an invalid gain or offset.")
     differential_millivolts = (float(voltage) - offset) * 1000.0 / gain
     return type_t_temperature_celsius(type_t_emf_millivolts(cjc_celsius) + differential_millivolts)
+
+
+def summarize_temperature_fahrenheit_samples(
+    raw_samples: object, calibration: dict[str, object], channel: str
+) -> tuple[float | None, str | None]:
+    """Return a robust temperature batch or a concise sensor-fault reason.
+
+    The shared stream can contain isolated invalid values, so a mostly valid
+    batch remains usable. A fully implausible batch—common with an open probe
+    or amplifier input—is deliberately not logged as temperature data.
+    """
+    if not isinstance(raw_samples, list) or not raw_samples:
+        return None, f"{channel} has no valid samples"
+    converted_count = 0
+    plausible: list[float] = []
+    for raw_voltage in raw_samples:
+        try:
+            voltage = float(raw_voltage)
+            if not math.isfinite(voltage):
+                continue
+            temperature_fahrenheit = temperature_from_amplified_voltage(voltage, calibration, channel) * 9.0 / 5.0 + 32.0
+        except (TypeError, ValueError):
+            continue
+        converted_count += 1
+        if TEMPERATURE_PLAUSIBLE_MIN_F <= temperature_fahrenheit <= TEMPERATURE_PLAUSIBLE_MAX_F:
+            plausible.append(temperature_fahrenheit)
+    if not plausible:
+        return None, (
+            f"{channel} converted outside the plausible {TEMPERATURE_PLAUSIBLE_MIN_F:.0f} to "
+            f"{TEMPERATURE_PLAUSIBLE_MAX_F:.0f} °F range"
+        )
+    if len(plausible) / max(converted_count, 1) < 0.8:
+        return None, f"{channel} readings are inconsistent; check probe and amplifier wiring"
+    return statistics.median(plausible), None
 
 
 def summarize_ain2_travel_range(samples: list[float]) -> dict[str, float | int | str]:
@@ -379,20 +427,6 @@ class PositionVelocitySnapshotSample:
     stream_gap_before: bool = False
 
 
-@dataclass(frozen=True)
-class AuxiliaryRawSample:
-    """One unscaled AIN0/AIN1 scan kept only for an operator diagnostic capture."""
-
-    timestamp: str
-    monotonic_seconds: float
-    scan_rate_hz: float
-    batch_received_at: str
-    ain0_voltage: float | None
-    ain1_voltage: float | None
-    device_backlog: int
-    ljm_backlog: int
-
-
 def format_local_timestamp(value: object, fallback: str = "Not available") -> str:
     """Render saved ISO timestamps compactly for operator-facing lists."""
     try:
@@ -402,82 +436,154 @@ def format_local_timestamp(value: object, fallback: str = "Not available") -> st
         return fallback
 
 
-def filtered_live_run_csv(folder: Path, filename: str, run_id: str) -> str:
-    """Return one logical run's CSV rows with their original header."""
-    source = folder / filename
-    if not source.is_file():
-        return ""
-    output = StringIO(newline="")
-    with source.open("r", newline="", encoding="utf-8") as source_file:
-        reader = csv.DictReader(source_file)
-        if not reader.fieldnames or "live_run_id" not in reader.fieldnames:
-            return ""
-        writer = csv.DictWriter(output, fieldnames=reader.fieldnames, lineterminator="\n")
-        writer.writeheader()
-        for row in reader:
-            if row.get("live_run_id") == run_id:
-                writer.writerow(row)
-    return output.getvalue()
-
-
-def write_live_run_archive(
-    destination: Path,
-    selected_runs: list[tuple[Path, dict[str, object]]],
-    selected_keys: set[str],
-    *,
-    manifest_extra: dict[str, object] | None = None,
-) -> int:
-    """Write and verify a self-contained ZIP before replacing its destination."""
-    options = [option for option in EXPORT_FILE_OPTIONS if option[0] in selected_keys]
-    if not selected_runs:
-        raise ValueError("At least one live run is required for an archive.")
-    if not options:
-        raise ValueError("Choose at least one data type for the archive.")
+def write_campaign_package(destination: Path, campaign: Campaign) -> int:
+    """Write and verify a complete, portable campaign handoff ZIP."""
     if not destination.parent.is_dir():
         raise OSError(f"Archive folder is unavailable: {destination.parent}")
-
-    manifest = {
-        "schema_version": 4,
+    if campaign.manifest.get("status") not in {"active", "completed"}:
+        raise ValueError("The selected campaign is not in a packageable state.")
+    files = [path for path in campaign.folder.rglob("*") if path.is_file()]
+    if not files:
+        raise ValueError("The selected campaign has no files to package.")
+    package_manifest = {
+        "schema_version": 1,
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_application": "Senior Design Test Stand",
-        "selected_live_runs": [
-            {"application_session": folder.name, "live_run_id": run.get("id")} for folder, run in selected_runs
-        ],
-        "included_file_types": [filename for _key, _label, filename in options],
+        "campaign_folder": campaign.folder.name,
+        "campaign_id": campaign.campaign_id,
+        "campaign_name": campaign.name,
+        "file_count": len(files),
     }
-    if manifest_extra:
-        manifest.update(manifest_extra)
-
     temporary = destination.with_name(f".{destination.name}.{time.time_ns()}.tmp")
-    count = 0
     try:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("export_manifest.json", json.dumps(manifest, indent=2))
-            count += 1
-            for folder, run in selected_runs:
-                run_id = str(run["id"])
-                archive_folder = f"{folder.name}/{run_id}"
-                for key, _label, filename in options:
-                    archive_filename = filename
-                    if key in {"cycles", "grease", "events"}:
-                        contents = filtered_live_run_csv(folder, filename, run_id)
-                    elif key == "metadata":
-                        contents = json.dumps(run, indent=2)
-                    else:
-                        contents = json.dumps(run.get("configuration", {}), indent=2)
-                    archive.writestr(f"{archive_folder}/{archive_filename}", contents)
-                    count += 1
+            archive.writestr(CAMPAIGN_PACKAGE_MANIFEST_FILENAME, json.dumps(package_manifest, indent=2))
+            for source in files:
+                relative = source.relative_to(campaign.folder).as_posix()
+                archive.write(source, f"{campaign.folder.name}/{relative}")
         with zipfile.ZipFile(temporary, "r") as archive:
             if archive.testzip() is not None:
-                raise OSError("The archive failed ZIP integrity verification.")
+                raise OSError("The campaign package failed ZIP integrity verification.")
         temporary.replace(destination)
-        return count
+        return len(files) + 1
     except Exception:
         try:
             temporary.unlink()
         except FileNotFoundError:
             pass
         raise
+
+
+def import_campaign_package(source: Path, output_root: Path) -> Campaign:
+    """Safely import a campaign ZIP without overwriting an existing campaign."""
+    temporary_root: Path | None = None
+    try:
+        with zipfile.ZipFile(source, "r") as archive:
+            try:
+                package_manifest = json.loads(archive.read(CAMPAIGN_PACKAGE_MANIFEST_FILENAME).decode("utf-8"))
+            except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("This ZIP is not a Senior Design campaign package.") from error
+            if not isinstance(package_manifest, dict):
+                raise ValueError("This ZIP has an invalid campaign package manifest.")
+            campaign_folder_name = str(package_manifest.get("campaign_folder", ""))
+            if not campaign_folder_name.startswith("Campaign_") or any(token in campaign_folder_name for token in ("/", "\\", "..")):
+                raise ValueError("This ZIP has an unsafe campaign folder name.")
+            prefix = f"{campaign_folder_name}/"
+            file_infos = [info for info in archive.infolist() if not info.is_dir() and info.filename != CAMPAIGN_PACKAGE_MANIFEST_FILENAME]
+            if not file_infos or any(not info.filename.startswith(prefix) for info in file_infos):
+                raise ValueError("This ZIP has an invalid campaign file layout.")
+
+            output_root.mkdir(parents=True, exist_ok=True)
+            destination = output_root / campaign_folder_name
+            suffix = 2
+            while destination.exists():
+                destination = output_root / f"{campaign_folder_name}_{suffix:02d}"
+                suffix += 1
+            temporary_root = Path(tempfile.mkdtemp(prefix=".campaign_import_", dir=output_root))
+            staged_campaign = temporary_root / campaign_folder_name
+            for info in file_infos:
+                relative = PurePosixPath(info.filename).relative_to(campaign_folder_name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError("This ZIP contains an unsafe file path.")
+                target = staged_campaign.joinpath(*relative.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info, "r") as source_file, target.open("wb") as destination_file:
+                    shutil.copyfileobj(source_file, destination_file)
+        imported = Campaign.open(staged_campaign)
+        if imported is None or imported.campaign_id != str(package_manifest.get("campaign_id", "")):
+            raise ValueError("The campaign package is incomplete or does not match its manifest.")
+        try:
+            staged_campaign.rename(destination)
+        except OSError:
+            # Windows can briefly retain a directory handle after ZIP extraction.
+            # The destination is a new, collision-checked folder, so copy before
+            # removing the staging source instead of risking an existing campaign.
+            try:
+                shutil.copytree(staged_campaign, destination)
+            except Exception:
+                shutil.rmtree(destination, ignore_errors=True)
+                raise
+            shutil.rmtree(staged_campaign)
+        temporary_root.rmdir()
+        temporary_root = None
+        reopened = Campaign.open(destination)
+        if reopened is None:
+            raise OSError("The imported campaign could not be opened after extraction.")
+        return reopened
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        raise error
+    finally:
+        if temporary_root is not None:
+            shutil.rmtree(temporary_root, ignore_errors=True)
+
+
+def write_calibration_package(destination: Path, configuration: dict[str, object]) -> int:
+    """Write a verified portable package for instrument setup only."""
+    setup_keys = ("position_calibration", "pressure_calibration", "temperature_calibration", "cycle_stops")
+    if any(key not in configuration for key in setup_keys):
+        raise ValueError("The calibration setup is incomplete.")
+    if not any(configuration.get(key) for key in setup_keys):
+        raise ValueError("There is no saved calibration or cycle-stop setup to export.")
+    if not destination.parent.is_dir():
+        raise OSError(f"Archive folder is unavailable: {destination.parent}")
+    manifest = {
+        "schema_version": 1,
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_application": "Senior Design Test Stand",
+        "package_type": "calibration_setup",
+        "included_setup": [key for key in setup_keys if configuration.get(key)],
+    }
+    temporary = destination.with_name(f".{destination.name}.{time.time_ns()}.tmp")
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(CALIBRATION_PACKAGE_MANIFEST_FILENAME, json.dumps(manifest, indent=2))
+            archive.writestr(CALIBRATION_PACKAGE_SETUP_FILENAME, json.dumps(configuration, indent=2))
+        with zipfile.ZipFile(temporary, "r") as archive:
+            if archive.testzip() is not None:
+                raise OSError("The calibration package failed ZIP integrity verification.")
+        temporary.replace(destination)
+        return 2
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def read_calibration_package(source: Path) -> dict[str, object]:
+    """Read a setup package without extracting untrusted ZIP contents."""
+    try:
+        with zipfile.ZipFile(source, "r") as archive:
+            manifest = json.loads(archive.read(CALIBRATION_PACKAGE_MANIFEST_FILENAME).decode("utf-8"))
+            configuration = json.loads(archive.read(CALIBRATION_PACKAGE_SETUP_FILENAME).decode("utf-8"))
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError, OSError, zipfile.BadZipFile) as error:
+        raise ValueError("This ZIP is not a Senior Design calibration package.") from error
+    if not isinstance(manifest, dict) or manifest.get("package_type") != "calibration_setup":
+        raise ValueError("This ZIP has an invalid calibration package manifest.")
+    if not isinstance(configuration, dict):
+        raise ValueError("This ZIP has an invalid calibration setup.")
+    return configuration
 
 
 class LivePlot(tk.Canvas):
@@ -894,7 +1000,6 @@ class PositionCalibrationDialog(tk.Toplevel):
         self.capture_buttons: list[ttk.Button] = []
         self.angle_vars = {1: tk.StringVar(), 2: tk.StringVar()}
         self.point_vars = {1: tk.StringVar(value="Not captured"), 2: tk.StringVar(value="Not captured")}
-        self.preview_var = tk.StringVar(value="No AIN2 reading captured yet.")
         self.status_var = tk.StringVar(value="Enter endpoint angles, then capture one full 10-second travel range.")
         self._build()
         self._load_existing_points()
@@ -925,14 +1030,6 @@ class PositionCalibrationDialog(tk.Toplevel):
         self.range_capture_button.pack(anchor="w", pady=(0, 10))
         self.capture_buttons.append(self.range_capture_button)
 
-        preview = ttk.LabelFrame(outer, text="AIN2 check", padding=12)
-        preview.pack(fill="x", pady=(0, 10))
-        self.preview_button = ttk.Button(preview, text="Read AIN2 Now", command=self.preview_ain2)
-        self.preview_button.pack(side="left")
-        ttk.Label(preview, textvariable=self.preview_var, wraplength=475, foreground="#475569").pack(
-            side="left", padx=12
-        )
-
         self.status_label = ttk.Label(outer, textvariable=self.status_var, wraplength=610, foreground="#1e3a8a")
         self.status_label.pack(anchor="w", pady=(2, 12))
         buttons = ttk.Frame(outer)
@@ -947,7 +1044,6 @@ class PositionCalibrationDialog(tk.Toplevel):
         state = "normal" if available else "disabled"
         for button in self.capture_buttons:
             button.configure(state=state)
-        self.preview_button.configure(state=state)
         if self.winfo_exists():
             self.after(250, self._refresh_live_controls)
 
@@ -998,53 +1094,6 @@ class PositionCalibrationDialog(tk.Toplevel):
         self.status_var.set("Capturing AIN2 travel range for 10 seconds… move through the full stroke repeatedly.")
         self.status_label.configure(foreground="#1e3a8a")
         self.after(int(POSITION_RANGE_CAPTURE_SECONDS * 1000), lambda: self._finish_travel_range(low_angle, high_angle))
-
-    def preview_ain2(self) -> None:
-        self._start_sample()
-
-    def _start_sample(self) -> None:
-        if self._sampling:
-            return
-        if not self.app.ain2_monitor.is_reading:
-            self.status_var.set("Waiting for the live AIN2 stream…")
-            self.status_label.configure(foreground="#1e3a8a")
-            self.after(100, self._start_sample)
-            return
-        self._sampling = True
-        self._sample_started_at = time.monotonic()
-        self.status_var.set("Sampling AIN2… hold the bushing still.")
-        self.status_label.configure(foreground="#1e3a8a")
-        self.after(550, self._check_stream_sample)
-
-    def _check_stream_sample(self) -> None:
-        samples = self.app.ain2_monitor.samples_since(self._sample_started_at, CALIBRATION_STREAM_SAMPLE_COUNT)
-        if len(samples) < CALIBRATION_STREAM_SAMPLE_COUNT:
-            if time.monotonic() - self._sample_started_at < 3.0:
-                self.after(60, self._check_stream_sample)
-                return
-            result: dict[str, object] = {"status": "error", "error": "Live AIN2 samples were not available."}
-        else:
-            result = summarize_ain2_samples(samples)
-        self._sampling = False
-        if result.get("status") != "success":
-            reason = result.get("error") or (
-                "Signal changed too much during the capture. Hold the bushing still and try again."
-            )
-            self.status_var.set(f"Capture not accepted: {reason}")
-            self.status_label.configure(foreground="#b91c1c")
-            return
-
-        voltage = float(result["voltage"])
-        standard_deviation = float(result["standard_deviation"])
-        span = float(result["span"])
-        text = f"AIN2: {voltage:.4f} V (σ {standard_deviation * 1000:.1f} mV, span {span * 1000:.1f} mV)"
-        calibration = self.app.position_calibration
-        if calibration:
-            estimated_angle, outside = self.app.angle_from_voltage(voltage, calibration)
-            text += f"  →  {estimated_angle:.3f}°" + (" (outside calibrated span)" if outside else "")
-        self.preview_var.set(text)
-        self.status_var.set("AIN2 reading accepted.")
-        self.status_label.configure(foreground="#166534")
 
     def _finish_travel_range(self, low_angle: float, high_angle: float) -> None:
         samples = self.app.ain2_monitor.samples_since(self._sample_started_at, None)
@@ -1105,7 +1154,6 @@ class PositionCalibrationDialog(tk.Toplevel):
             for point in (1, 2):
                 self.point_vars[point].set("Not captured")
                 self.angle_vars[point].set("")
-            self.preview_var.set("No AIN2 reading captured yet.")
             self.status_var.set("Saved calibration cleared.")
 
 
@@ -1126,7 +1174,6 @@ class PressureCalibrationDialog(tk.Toplevel):
         self.capture_buttons: list[ttk.Button] = []
         self.pressure_vars = {1: tk.StringVar(), 2: tk.StringVar()}
         self.point_vars = {1: tk.StringVar(value="Not captured"), 2: tk.StringVar(value="Not captured")}
-        self.preview_var = tk.StringVar(value="No AIN4 reading captured yet.")
         self.status_var = tk.StringVar(value="Enter the gauge pressure and capture two steady points.")
         self._build()
         self._load_existing_points()
@@ -1158,13 +1205,6 @@ class PressureCalibrationDialog(tk.Toplevel):
                 row=1, column=0, columnspan=3, sticky="w", pady=(8, 0)
             )
 
-        preview = ttk.LabelFrame(outer, text="AIN4 check", padding=12)
-        preview.pack(fill="x", pady=(0, 10))
-        self.preview_button = ttk.Button(preview, text="Read AIN4 Now", command=self.preview_ain4)
-        self.preview_button.pack(side="left")
-        ttk.Label(preview, textvariable=self.preview_var, wraplength=475, foreground="#475569").pack(
-            side="left", padx=12
-        )
         self.status_label = ttk.Label(outer, textvariable=self.status_var, wraplength=620, foreground="#1e3a8a")
         self.status_label.pack(anchor="w", pady=(2, 12))
         buttons = ttk.Frame(outer)
@@ -1179,7 +1219,6 @@ class PressureCalibrationDialog(tk.Toplevel):
         state = "normal" if available else "disabled"
         for button in self.capture_buttons:
             button.configure(state=state)
-        self.preview_button.configure(state=state)
         if self.winfo_exists():
             self.after(250, self._refresh_live_controls)
 
@@ -1223,10 +1262,7 @@ class PressureCalibrationDialog(tk.Toplevel):
         if pressure is not None:
             self._start_sample(point, pressure)
 
-    def preview_ain4(self) -> None:
-        self._start_sample(None, None)
-
-    def _start_sample(self, point: int | None, pressure: float | None) -> None:
+    def _start_sample(self, point: int, pressure: float) -> None:
         if self._sampling:
             return
         if not self.app.ain2_monitor.is_reading:
@@ -1266,24 +1302,15 @@ class PressureCalibrationDialog(tk.Toplevel):
             self.status_var.set("Capture not accepted: AIN4 is at or near its 2.5 V input limit. Check the sensor output scaling.")
             self.status_label.configure(foreground="#b91c1c")
             return
-        if point is not None and pressure is not None:
-            self.points[point] = {
-                "pressure_psi": pressure,
-                "voltage": voltage,
-                "standard_deviation": standard_deviation,
-                "span": span,
-            }
-            self._set_point_label(point)
-            self.status_var.set(f"Point {point} captured. Capture the other point, then apply the calibration.")
-            self.app.log_event("AIN4 pressure calibration point captured", f"Point {point}: {voltage:.4f} V at {pressure:.1f} psi.")
-        else:
-            text = f"AIN4: {voltage:.4f} V (σ {standard_deviation * 1000:.1f} mV, span {span * 1000:.1f} mV)"
-            calibration = self.app.pressure_calibration
-            if calibration:
-                estimated_pressure, outside = self.app.pressure_from_voltage(voltage, calibration)
-                text += f"  →  {estimated_pressure:,.1f} psi" + (" (outside calibrated span)" if outside else "")
-            self.preview_var.set(text)
-            self.status_var.set("AIN4 reading accepted.")
+        self.points[point] = {
+            "pressure_psi": pressure,
+            "voltage": voltage,
+            "standard_deviation": standard_deviation,
+            "span": span,
+        }
+        self._set_point_label(point)
+        self.status_var.set(f"Point {point} captured. Capture the other point, then apply the calibration.")
+        self.app.log_event("AIN4 pressure calibration point captured", f"Point {point}: {voltage:.4f} V at {pressure:.1f} psi.")
         self.status_label.configure(foreground="#166534")
 
     def apply_calibration(self) -> None:
@@ -1318,7 +1345,6 @@ class PressureCalibrationDialog(tk.Toplevel):
             for point in (1, 2):
                 self.point_vars[point].set("Not captured")
                 self.pressure_vars[point].set("")
-            self.preview_var.set("No AIN4 reading captured yet.")
             self.status_var.set("Saved calibration cleared.")
 
 
@@ -1717,134 +1743,95 @@ class CycleStopsDialog(tk.Toplevel):
             self.status_var.set("Cycle stops cleared. Cycle counting is disabled.")
 
 
-class ExportDataDialog(tk.Toplevel):
-    """Package selected direct-output test folders into an optional ZIP."""
+class CampaignDialog(tk.Toplevel):
+    """Explicitly create or select the multi-session campaign for new runs."""
 
-    FILE_OPTIONS = EXPORT_FILE_OPTIONS
-
-    def __init__(self, app: "TestStandApp", preselect_run_id: str | None = None) -> None:
+    def __init__(self, app: "TestStandApp") -> None:
         super().__init__(app)
         self.app = app
-        self.preselect_run_id = preselect_run_id
-        self.title("Export Test Stand Data")
-        self.geometry("880x650")
-        self.minsize(760, 560)
+        self.title("Create or Select Campaign")
+        self.geometry("760x500")
+        self.minsize(640, 420)
         self.transient(app)
-        self.option_vars = {key: tk.BooleanVar(value=True) for key, _label, _filename in self.FILE_OPTIONS}
-        self.status_var = tk.StringVar(value="Select runs to export.")
+        self.name_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Create a new campaign or resume an active campaign.")
+        self.campaigns: list[Campaign] = []
         self._build()
-        self.refresh_runs()
+        self.refresh_campaigns()
         self.lift()
         self.focus_force()
 
     def _build(self) -> None:
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Export Test Runs", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="Test Campaign", font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Select one or more retained runs.",
-            wraplength=710,
-            foreground="#475569",
-        ).pack(anchor="w", pady=(4, 10))
+            text="A campaign keeps counts across multiple dated runs. Select it explicitly before starting a run.",
+            foreground="#475569", wraplength=680,
+        ).pack(anchor="w", pady=(4, 12))
 
-        runs_frame = ttk.Frame(outer)
-        runs_frame.pack(fill="both", expand=True)
-        ttk.Label(runs_frame, text="Test runs (newest first):").pack(anchor="w")
-        list_frame = ttk.Frame(runs_frame)
-        list_frame.pack(fill="both", expand=True, pady=(4, 10))
-        self.runs_list = tk.Listbox(list_frame, selectmode="extended", exportselection=False, height=9)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.runs_list.yview)
-        self.runs_list.configure(yscrollcommand=scrollbar.set)
-        self.runs_list.pack(side="left", fill="both", expand=True)
+        new_campaign = ttk.LabelFrame(outer, text="New campaign", padding=10)
+        new_campaign.pack(fill="x")
+        ttk.Label(new_campaign, text="Name").grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(new_campaign, textvariable=self.name_var, width=48)
+        entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        ttk.Button(new_campaign, text="Create", style="Grease.TButton", command=self.create_campaign).grid(row=0, column=2)
+        new_campaign.columnconfigure(1, weight=1)
+        entry.focus_set()
+
+        existing = ttk.LabelFrame(outer, text="Resume existing campaign", padding=10)
+        existing.pack(fill="both", expand=True, pady=(12, 8))
+        list_frame = ttk.Frame(existing)
+        list_frame.pack(fill="both", expand=True)
+        self.campaign_list = tk.Listbox(list_frame, exportselection=False, height=9)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.campaign_list.yview)
+        self.campaign_list.configure(yscrollcommand=scrollbar.set)
+        self.campaign_list.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        ttk.Button(runs_frame, text="Refresh", command=self.refresh_runs).pack(anchor="e")
+        controls = ttk.Frame(existing)
+        controls.pack(fill="x", pady=(8, 0))
+        ttk.Button(controls, text="Refresh", command=self.refresh_campaigns).pack(side="left")
+        ttk.Button(controls, text="Resume Selected", command=self.resume_selected).pack(side="right")
 
-        options = ttk.LabelFrame(outer, text="Include", padding=8)
-        options.pack(fill="x", pady=(12, 8))
-        for row, (key, label, _filename) in enumerate(self.FILE_OPTIONS):
-            ttk.Checkbutton(options, text=label, variable=self.option_vars[key]).grid(
-                row=row // 2, column=row % 2, sticky="w", padx=(0, 22), pady=2
-            )
+        ttk.Label(outer, textvariable=self.status_var, foreground="#1e3a8a", wraplength=680).pack(anchor="w", pady=(4, 0))
 
-        ttk.Label(outer, textvariable=self.status_var, foreground="#1e3a8a", wraplength=710).pack(
-            anchor="w", pady=(0, 8)
-        )
-        buttons = ttk.Frame(outer)
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Export Selected…", style="Grease.TButton", command=self.export).pack(side="right")
-
-    def refresh_runs(self) -> None:
-        if self.app.logger is not None:
-            self.app.logger.flush()
-        self.live_runs: list[tuple[Path, dict[str, object]]] = []
-        for folder in self.app.available_run_folders():
-            for run in reversed(CsvLogger.read_live_runs(folder)):
-                self.live_runs.append((folder, run))
-        self.runs_list.delete(0, "end")
-        selected_index: int | None = None
-        for index, (folder, run) in enumerate(self.live_runs):
-            run_id = str(run.get("id", "unknown"))
-            state = str(run.get("status", "unknown")).replace("_", " ")
-            export_note = "exported" if run.get("exported_at") else "not exported"
-            current = " • active" if self.app.logger is not None and run_id == self.app.current_live_run_id and folder == self.app.logger.folder else ""
-            completed = format_local_timestamp(run.get("ended_at"), fallback="In progress")
-            self.runs_list.insert(
+    def refresh_campaigns(self) -> None:
+        self.campaigns = Campaign.available(self.app.run_output_root())
+        self.campaign_list.delete(0, "end")
+        for campaign in self.campaigns:
+            status = str(campaign.manifest.get("status", "unknown")).replace("_", " ")
+            created = format_local_timestamp(campaign.manifest.get("created_at"), fallback="Unknown date")
+            self.campaign_list.insert(
                 "end",
-                f"{folder.name}  |  {run_id}  |  Completed: {completed}  |  {state}, {export_note}{current}",
+                f"{campaign.name}  |  {campaign.completed_cycles:,} cycles  |  {status}  |  {created}",
             )
-            if self.app.logger is not None and run_id == self.preselect_run_id and folder == self.app.logger.folder:
-                selected_index = index
-        if self.live_runs:
-            self.runs_list.selection_set(0 if selected_index is None else selected_index)
-            self.status_var.set(f"{len(self.live_runs)} test run(s) found. Select the data to package.")
+        if self.campaigns:
+            self.campaign_list.selection_set(0)
+            self.status_var.set("Select an active campaign to continue its total.")
         else:
-            self.status_var.set("No saved test rounds found in the current run output folder.")
+            self.status_var.set("No campaigns found in the selected output folder.")
 
-    def export(self) -> None:
-        selected_indexes = self.runs_list.curselection()
-        selected_options = [option for option in self.FILE_OPTIONS if self.option_vars[option[0]].get()]
-        if not selected_indexes:
-            messagebox.showerror("Select a test run", "Select at least one test run to export.", parent=self)
-            return
-        if not selected_options:
-            messagebox.showerror("Select data", "Choose at least one data type to include.", parent=self)
-            return
-        destination = filedialog.asksaveasfilename(
-            parent=self,
-            title="Save Test Stand Export",
-            defaultextension=".zip",
-            filetypes=(("ZIP archive", "*.zip"),),
-            initialfile=f"TestStand_Export_{datetime.now():%Y%m%d_%H%M%S}.zip",
-        )
-        if not destination:
-            return
-
-        if self.app.logger is not None:
-            self.app.logger.flush()
-        selected_runs = [self.live_runs[index] for index in selected_indexes]
-        exported_run_ids_by_folder: dict[Path, set[str]] = {}
+    def create_campaign(self) -> None:
         try:
-            count = write_live_run_archive(
-                Path(destination),
-                selected_runs,
-                {key for key, _label, _filename in selected_options},
-                manifest_extra={"archive_type": "manual"},
-            )
-            for folder, run in selected_runs:
-                exported_run_ids_by_folder.setdefault(folder, set()).add(str(run["id"]))
-        except (OSError, ValueError, csv.Error, zipfile.BadZipFile) as error:
-            messagebox.showerror("Export failed", f"Could not create the ZIP archive:\n{error}", parent=self)
+            campaign = Campaign.create(self.app.run_output_root(), self.name_var.get())
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Create campaign", str(error), parent=self)
             return
-        for folder, run_ids in exported_run_ids_by_folder.items():
-            CsvLogger.mark_live_runs_exported_in_folder(folder, run_ids)
-        self.status_var.set(f"Exported {count} file(s) from {len(selected_runs)} test run(s).")
-        messagebox.showinfo(
-            "Export complete",
-            f"Created ZIP archive with {count} file(s) from {len(selected_runs)} test run(s).\n\n{destination}",
-            parent=self,
-        )
-        self.refresh_runs()
+        if self.app.select_campaign(campaign):
+            self.destroy()
+
+    def resume_selected(self) -> None:
+        selected = self.campaign_list.curselection()
+        if not selected:
+            messagebox.showerror("Select campaign", "Select an active campaign to resume.", parent=self)
+            return
+        campaign = self.campaigns[selected[0]]
+        if campaign.manifest.get("status") != "active":
+            messagebox.showerror("Campaign completed", "This campaign is finished. Create a new campaign for additional runs.", parent=self)
+            return
+        if self.app.select_campaign(campaign):
+            self.destroy()
 
 
 class EventTerminalDialog(tk.Toplevel):
@@ -2081,94 +2068,6 @@ class CycleFrequencyHistoryDialog(tk.Toplevel):
         self.destroy()
 
 
-class RawAuxiliaryInputsDialog(tk.Toplevel):
-    """Small read-only aid for identifying AIN0/AIN1 sensor wiring."""
-
-    def __init__(self, app: "TestStandApp") -> None:
-        super().__init__(app)
-        self.app = app
-        self.title("Raw Auxiliary Inputs")
-        self.geometry("510x300")
-        self.minsize(440, 260)
-        self.configure(background="#f1f5f9")
-        self._refresh_after_id: str | None = None
-        self.value_vars = {channel: tk.StringVar(value="— V") for channel in ("AIN0", "AIN1")}
-        self.status_var = tk.StringVar(value="Waiting for the LabJack stream.")
-
-        outer = ttk.Frame(self, padding=18)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Raw auxiliary inputs", font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Live AIN0/AIN1 voltage. Save 60 seconds for stream diagnostics.",
-            foreground="#475569",
-            wraplength=465,
-            justify="left",
-        ).pack(anchor="w", pady=(5, 14))
-
-        values = ttk.Frame(outer)
-        values.pack(fill="x")
-        for column, channel in enumerate(("AIN0", "AIN1")):
-            values.columnconfigure(column, weight=1, uniform="raw_aux")
-            card = ttk.LabelFrame(values, text=channel, padding=12)
-            card.grid(row=0, column=column, sticky="nsew", padx=(0, 6) if column == 0 else (6, 0))
-            ttk.Label(card, text="Raw voltage", foreground="#64748b").pack(anchor="w")
-            ttk.Label(card, textvariable=self.value_vars[channel], font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(5, 0))
-
-        footer = ttk.Frame(outer)
-        footer.pack(fill="x", pady=(16, 0))
-        ttk.Label(footer, textvariable=self.status_var, foreground="#64748b", wraplength=290, justify="left").pack(side="left")
-        self.save_button = ttk.Button(
-            footer,
-            text="Save 60-Second Capture…",
-            command=self.app.save_raw_auxiliary_capture,
-            state="disabled",
-        )
-        self.save_button.pack(side="right")
-        self.protocol("WM_DELETE_WINDOW", self._close)
-        self._refresh()
-
-    def _refresh(self) -> None:
-        try:
-            if not self.winfo_exists():
-                return
-        except tk.TclError:
-            return
-
-        if not self.app.labjack_available:
-            for variable in self.value_vars.values():
-                variable.set("— V")
-            self.save_button.configure(state="disabled")
-            self.status_var.set("Waiting for the connected LabJack T4 stream.")
-        else:
-            updated = False
-            for channel, variable in self.value_vars.items():
-                value = self.app.auxiliary_raw_voltages.get(channel)
-                if value is None:
-                    variable.set("— V")
-                else:
-                    variable.set(f"{value:.5f} V")
-                    updated = True
-            history_seconds = self.app.raw_auxiliary_history_seconds()
-            if history_seconds >= RAW_AUXILIARY_CAPTURE_SECONDS:
-                self.save_button.configure(state="normal")
-                self.status_var.set("60 seconds ready • 200 samples/s per channel • raw diagnostic CSV only")
-            else:
-                self.save_button.configure(state="disabled")
-                self.status_var.set(
-                    f"Collecting raw capture: {history_seconds:.1f} / {RAW_AUXILIARY_CAPTURE_SECONDS} seconds"
-                    if updated else "AIN0/AIN1 samples have not arrived yet."
-                )
-        self._refresh_after_id = self.after(100, self._refresh)
-
-    def _close(self) -> None:
-        if self._refresh_after_id is not None:
-            self.after_cancel(self._refresh_after_id)
-            self._refresh_after_id = None
-        self.app.raw_auxiliary_inputs_window = None
-        self.destroy()
-
-
 class Ps12dcSolenoidDialog(tk.Toplevel):
     """Manual and repeating-timer controls for the PS12DC S0 solenoid output."""
 
@@ -2392,6 +2291,10 @@ class TestStandApp(tk.Tk):
         self.logger: CsvLogger | None = None
         self.run_output_config = self.load_run_output_config()
         self.active_run_output_root: Path | None = None
+        # A campaign is selected explicitly after every app launch. It owns
+        # multiple dated run folders and the count carried between sessions.
+        self.campaign: Campaign | None = None
+        self.current_campaign_session_id: str | None = None
         self.is_running = False
         self.current_live_run_id: str | None = None
         self._closing = False
@@ -2415,6 +2318,7 @@ class TestStandApp(tk.Tk):
         self.cycle_stops = self.load_cycle_stops()
         self.ain2_monitor = LabJackAin2Monitor()
         self.labjack_available = False
+        self._labjack_seen_connected = False
         self.next_ain2_poll = 0.0
         self.last_labjack_signature = ""
         self.ain2_voltage: float | None = None
@@ -2422,13 +2326,13 @@ class TestStandApp(tk.Tk):
         self.bushing_position: float | None = None
         self.bushing_velocity: float | None = None
         self.auxiliary_raw_voltages: dict[str, float | None] = {"AIN0": None, "AIN1": None}
-        self._raw_auxiliary_samples: deque[AuxiliaryRawSample] = deque(maxlen=RAW_AUXILIARY_HISTORY_MAX_SAMPLES)
-        self._last_auxiliary_capture_monotonic: float | None = None
-        self._last_auxiliary_capture_at: datetime | None = None
         self.grease_pressure: float | None = None
         self._display_pressure_voltage_samples: deque[float] = deque(maxlen=5)
         self.temperature_history: dict[int, list[tuple[float, float]]] = {1: [], 2: []}
         self.current_temperatures: dict[int, float | None] = {1: None, 2: None}
+        self._active_faults: dict[str, tuple[str, str]] = {}
+        self._fault_failure_batches: dict[str, int] = {}
+        self._fault_recovery_batches: dict[str, int] = {}
         self.temperature_history_windows: dict[int, TemperatureHistoryDialog | None] = {1: None, 2: None}
         self.cycle_frequency_history: list[tuple[float, float]] = []
         self.cycle_frequency_history_window: CycleFrequencyHistoryDialog | None = None
@@ -2460,16 +2364,16 @@ class TestStandApp(tk.Tk):
         }
         self.event_terminal: EventTerminalDialog | None = None
         self.graph_review_window: GraphReviewDialog | None = None
-        self.raw_auxiliary_inputs_window: RawAuxiliaryInputsDialog | None = None
         self.pressure_calibration_window: PressureCalibrationDialog | None = None
         self.temperature_calibration_window: TemperatureCalibrationDialog | None = None
         self.ps12dc_solenoid_window: Ps12dcSolenoidDialog | None = None
+        self.campaign_window: CampaignDialog | None = None
 
         self._build_style()
         self._build_menu()
         self._build_interface()
         self._set_labjack_dependent_controls(False)
-        self.log_event("Application started", f"Run output: {self.run_output_root()}")
+        self.log_event("Application started", "Select or create a campaign before starting a test run.")
         if self.paths.migrated_legacy_config:
             migrated = ", ".join(self.paths.migrated_legacy_config)
             self.log_event("Local configuration migrated", f"Copied {migrated} to {self.paths.config}.")
@@ -2509,7 +2413,11 @@ class TestStandApp(tk.Tk):
     def _build_menu(self) -> None:
         menu_bar = tk.Menu(self)
         file_menu = tk.Menu(menu_bar, tearoff=False)
-        file_menu.add_command(label="Export Runs…", command=self.open_export_window)
+        file_menu.add_command(label="Create / Select Campaign…", command=self.open_campaign_window)
+        file_menu.add_command(label="Import Campaign Package…", command=self.import_campaign_package)
+        file_menu.add_command(label="Export Campaign Package…", command=self.export_campaign_package)
+        file_menu.add_command(label="Finish Selected Campaign", command=self.finish_selected_campaign)
+        file_menu.add_separator()
         file_menu.add_command(label="Set Run Output Folder…", command=self.choose_run_output_folder)
         file_menu.add_command(label="Use Default Local Run Folder", command=self.use_default_run_output_folder)
         file_menu.add_command(label="Open Run Output Folder", command=self.open_run_output_folder)
@@ -2520,7 +2428,9 @@ class TestStandApp(tk.Tk):
         tools_menu.add_command(label="Calibrate FIO4 Pressure…", command=self.open_pressure_calibration_window)
         tools_menu.add_command(label="Configure Temperatures…", command=self.open_temperature_calibration_window)
         tools_menu.add_separator()
-        tools_menu.add_command(label="Read Raw AIN0 / AIN1…", command=self.open_raw_auxiliary_inputs_window)
+        tools_menu.add_command(label="Import Calibration Package…", command=self.import_calibration_package)
+        tools_menu.add_command(label="Export Calibration Package…", command=self.export_calibration_package)
+        tools_menu.add_separator()
         tools_menu.add_command(label="PS12DC Solenoid Control…", command=self.open_ps12dc_solenoid_window)
         menu_bar.add_cascade(label="Tools", menu=tools_menu)
         help_menu = tk.Menu(menu_bar, tearoff=False)
@@ -2560,7 +2470,7 @@ class TestStandApp(tk.Tk):
         ).pack(anchor="w", pady=(6, 16))
 
         ttk.Label(outer, text="Data", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="Export runs from File → Export Runs…", justify="left", wraplength=600).pack(
+        ttk.Label(outer, text="Use File → Export Campaign Package… to back up or hand off a complete campaign.", justify="left", wraplength=600).pack(
             anchor="w", pady=(6, 18)
         )
 
@@ -2578,19 +2488,40 @@ class TestStandApp(tk.Tk):
         ).pack(side="left", padx=(8, 0))
 
     def _build_interface(self) -> None:
-        header = ttk.Frame(self, style="Header.TFrame", padding=(24, 12))
-        header.pack(fill="x")
-        header.columnconfigure(0, weight=1)
-        title = ttk.Frame(header, style="Header.TFrame")
+        self.header = ttk.Frame(self, style="Header.TFrame", padding=(24, 12))
+        self.header.pack(fill="x")
+        self.header.columnconfigure(0, weight=1)
+        title = ttk.Frame(self.header, style="Header.TFrame")
         title.grid(row=0, column=0, sticky="w")
         ttk.Label(title, text="Senior Design Test Stand", style="Header.TLabel").pack(anchor="w")
         self.header_detail_var = tk.StringVar(value="AIN2 position  •  AIN4 pressure  •  Cycle counting")
         ttk.Label(title, textvariable=self.header_detail_var, style="Subheader.TLabel").pack(anchor="w", pady=(3, 0))
         self.labjack_status_var = tk.StringVar(value="LabJack T4 • Checking connection")
         self.labjack_status_label = ttk.Label(
-            header, textvariable=self.labjack_status_var, style="Subheader.TLabel", font=("Segoe UI", 10, "bold")
+            self.header, textvariable=self.labjack_status_var, style="Subheader.TLabel", font=("Segoe UI", 10, "bold")
         )
         self.labjack_status_label.grid(row=0, column=1, sticky="e")
+
+        self.fault_banner = tk.Frame(self, background="#991b1b", padx=24, pady=9)
+        self.fault_title_var = tk.StringVar()
+        self.fault_detail_var = tk.StringVar()
+        tk.Label(
+            self.fault_banner,
+            textvariable=self.fault_title_var,
+            background="#991b1b",
+            foreground="white",
+            font=("Segoe UI", 12, "bold"),
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            self.fault_banner,
+            textvariable=self.fault_detail_var,
+            background="#991b1b",
+            foreground="#fee2e2",
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
 
         main = ttk.Frame(self, padding=16)
         main.pack(fill="both", expand=True)
@@ -2609,7 +2540,7 @@ class TestStandApp(tk.Tk):
             self.metrics, 0, 1, "Cycle Frequency", "frequency", "0.0 cpm", None,
             expand_command=self.open_cycle_frequency_history_window,
         )
-        self._metric(self.metrics, 0, 2, "Test Time", "test_time", "00:00:00", None)
+        self._metric(self.metrics, 0, 2, "Active Test Time", "test_time", "00:00:00", None)
         self._metric(self.metrics, 0, 3, "Bushing Position", "position", "Waiting…", self.bushing_detail_var)
         self._metric(self.metrics, 0, 4, "Bushing Velocity", "velocity", "— °/s", None)
 
@@ -2696,7 +2627,7 @@ class TestStandApp(tk.Tk):
             count_buttons, text="Pause", style="Stop.TButton", command=self.pause_counting, state="disabled"
         )
         self.stop_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self.reset_button = ttk.Button(count_buttons, text="Save & Reset", command=self.reset_counting)
+        self.reset_button = ttk.Button(count_buttons, text="End Run", command=self.reset_counting, state="disabled")
         self.reset_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.setup_status = ttk.LabelFrame(sidebar, text="Setup Status", padding=10)
         self.setup_status.grid(row=1, column=0, sticky="ew", pady=(10, 10))
@@ -2725,6 +2656,7 @@ class TestStandApp(tk.Tk):
         self.setup_status_vars: dict[str, tk.StringVar] = {}
         self.setup_status_labels: dict[str, ttk.Label] = {}
         rows = (
+            ("campaign", "Campaign"),
             ("labjack", "LabJack T4"),
             ("position", "AIN2 position"),
             ("stops", "Cycle stops"),
@@ -2738,6 +2670,10 @@ class TestStandApp(tk.Tk):
             status.grid(row=row, column=1, sticky="e", padx=(18, 0), pady=2)
             self.setup_status_vars[key] = value
             self.setup_status_labels[key] = status
+            if key == "campaign":
+                ttk.Button(self.setup_status, text="Select…", command=self.open_campaign_window).grid(
+                    row=row, column=2, sticky="e", padx=(8, 0), pady=2
+                )
         self.setup_status.columnconfigure(1, weight=1)
 
     def _set_setup_status(self, key: str, value: str, color: str) -> None:
@@ -2747,6 +2683,13 @@ class TestStandApp(tk.Tk):
     def _refresh_setup_status(self) -> None:
         if not hasattr(self, "setup_status_vars"):
             return
+        if self.campaign is None:
+            self._set_setup_status("campaign", "Required", "#b45309")
+        else:
+            campaign_name = self.campaign.name
+            if len(campaign_name) > 24:
+                campaign_name = f"{campaign_name[:23]}…"
+            self._set_setup_status("campaign", campaign_name, "#166534")
         self._set_setup_status("labjack", "Connected" if self.labjack_available else "Not connected", "#166534" if self.labjack_available else "#b45309")
         self._set_setup_status("position", "Saved" if self.position_calibration else "Required", "#166534" if self.position_calibration else "#b45309")
         if not self.position_calibration:
@@ -2804,6 +2747,73 @@ class TestStandApp(tk.Tk):
         if self.event_terminal is not None and self.event_terminal.winfo_exists():
             self.event_terminal.append(text)
 
+    def _render_fault_banner(self) -> None:
+        """Keep active sensor and connection faults visible without modal popups."""
+        if not hasattr(self, "fault_banner"):
+            return
+        if not self._active_faults:
+            self.fault_banner.pack_forget()
+            return
+        ordered_keys = sorted(
+            self._active_faults,
+            key=lambda key: (
+                FAULT_DISPLAY_ORDER.index(key) if key in FAULT_DISPLAY_ORDER else len(FAULT_DISPLAY_ORDER),
+                key,
+            ),
+        )
+        faults = tuple(self._active_faults[key] for key in ordered_keys)
+        title, detail = faults[0]
+        if len(faults) > 1:
+            title = f"{title}  (+{len(faults) - 1} more active alarm{'s' if len(faults) > 2 else ''})"
+        self.fault_title_var.set(f"⚠ ACTIVE ALARM — {title}")
+        self.fault_detail_var.set(detail)
+        self.fault_banner.pack(fill="x", after=self.header)
+
+    def _observe_fault(
+        self,
+        key: str,
+        title: str,
+        detail: str,
+        is_fault: bool,
+        *,
+        activation_batches: int = SENSOR_FAULT_ACTIVATION_BATCHES,
+        clear_batches: int = SENSOR_FAULT_CLEAR_BATCHES,
+    ) -> None:
+        """Debounce persistent faults and log only their activation/clear transitions."""
+        if is_fault:
+            self._fault_recovery_batches[key] = 0
+            self._fault_failure_batches[key] = self._fault_failure_batches.get(key, 0) + 1
+            if self._fault_failure_batches[key] < activation_batches:
+                return
+            was_active = key in self._active_faults
+            self._active_faults[key] = (title, detail)
+            self._render_fault_banner()
+            if not was_active:
+                self.log_event(f"ALARM — {title}", detail)
+                try:
+                    self.bell()
+                except tk.TclError:
+                    pass
+            return
+
+        self._fault_failure_batches[key] = 0
+        if key not in self._active_faults:
+            return
+        self._fault_recovery_batches[key] = self._fault_recovery_batches.get(key, 0) + 1
+        if self._fault_recovery_batches[key] < clear_batches:
+            return
+        cleared_title, _cleared_detail = self._active_faults.pop(key)
+        self._fault_recovery_batches[key] = 0
+        self._render_fault_banner()
+        self.log_event(f"Alarm cleared — {cleared_title}", "Valid readings have recovered.")
+
+    def _remove_fault(self, key: str) -> None:
+        """Remove an alarm whose underlying input has been intentionally reconfigured."""
+        self._fault_failure_batches.pop(key, None)
+        self._fault_recovery_batches.pop(key, None)
+        if self._active_faults.pop(key, None) is not None:
+            self._render_fault_banner()
+
     def open_event_terminal(self) -> None:
         """Open one full-size, live-updating event terminal for this session."""
         if self.event_terminal is not None and self.event_terminal.winfo_exists():
@@ -2841,16 +2851,6 @@ class TestStandApp(tk.Tk):
             existing.focus_set()
             return
         self.cycle_frequency_history_window = CycleFrequencyHistoryDialog(self)
-
-    def open_raw_auxiliary_inputs_window(self) -> None:
-        """Show unscaled AIN0/AIN1 values without opening another T4 connection."""
-        existing = self.raw_auxiliary_inputs_window
-        if existing is not None and existing.winfo_exists():
-            existing.deiconify()
-            existing.lift()
-            existing.focus_set()
-            return
-        self.raw_auxiliary_inputs_window = RawAuxiliaryInputsDialog(self)
 
     def open_pressure_calibration_window(self) -> None:
         """Open the FIO4/AIN4 gauge-calibration utility without another T4 handle."""
@@ -2910,140 +2910,6 @@ class TestStandApp(tk.Tk):
         if self.request_ps12dc_s0(False):
             self.log_event("PS12DC S0 stopped", "Test paused; S0 commanded OFF.")
 
-    def raw_auxiliary_history_seconds(self) -> float:
-        """Return the time span currently available for a raw AIN0/AIN1 capture."""
-        if len(self._raw_auxiliary_samples) < 2:
-            return 0.0
-        return max(
-            0.0,
-            self._raw_auxiliary_samples[-1].monotonic_seconds - self._raw_auxiliary_samples[0].monotonic_seconds,
-        )
-
-    @staticmethod
-    def _raw_auxiliary_value(value: object) -> float | None:
-        try:
-            candidate = float(value)
-        except (TypeError, ValueError):
-            return None
-        return candidate if math.isfinite(candidate) else None
-
-    def _record_raw_auxiliary_scans(
-        self,
-        raw_scans: object,
-        scan_rate_hz: float,
-        batch_end_monotonic: float,
-        batch_end_at: datetime,
-        device_backlog: int,
-        ljm_backlog: int,
-    ) -> None:
-        """Keep a continuous, sample-clocked minute of unscaled AIN0/AIN1 scans."""
-        if not isinstance(raw_scans, list) or not raw_scans:
-            return
-        scan_count = len(raw_scans)
-        sample_interval = 1.0 / max(scan_rate_hz, 1.0)
-        if self._last_auxiliary_capture_monotonic is None or self._last_auxiliary_capture_at is None:
-            first_monotonic = batch_end_monotonic - (scan_count - 1) * sample_interval
-            first_at = batch_end_at - timedelta(seconds=(scan_count - 1) * sample_interval)
-        else:
-            # eStreamRead returns batches.  Their arrival time can jitter even
-            # when the T4 is sampling continuously, so never turn host-side
-            # scheduling delays into false sensor gaps in the diagnostic CSV.
-            first_monotonic = self._last_auxiliary_capture_monotonic + sample_interval
-            first_at = self._last_auxiliary_capture_at + timedelta(seconds=sample_interval)
-        for index, scan in enumerate(raw_scans):
-            if not isinstance(scan, (list, tuple)) or len(scan) != 2:
-                continue
-            ain0, ain1 = (self._raw_auxiliary_value(value) for value in scan)
-            sample_monotonic = first_monotonic + index * sample_interval
-            sample_at_value = first_at + timedelta(seconds=index * sample_interval)
-            sample_at = sample_at_value.isoformat(timespec="milliseconds")
-            self._raw_auxiliary_samples.append(
-                AuxiliaryRawSample(
-                    timestamp=sample_at,
-                    monotonic_seconds=sample_monotonic,
-                    scan_rate_hz=scan_rate_hz,
-                    batch_received_at=batch_end_at.isoformat(timespec="milliseconds"),
-                    ain0_voltage=ain0,
-                    ain1_voltage=ain1,
-                    device_backlog=device_backlog,
-                    ljm_backlog=ljm_backlog,
-                )
-            )
-            if ain0 is not None:
-                self.auxiliary_raw_voltages["AIN0"] = ain0
-            if ain1 is not None:
-                self.auxiliary_raw_voltages["AIN1"] = ain1
-            self._last_auxiliary_capture_monotonic = sample_monotonic
-            self._last_auxiliary_capture_at = sample_at_value
-
-    def save_raw_auxiliary_capture(self) -> None:
-        """Save one operator-requested minute of uncalibrated auxiliary readings."""
-        if self.raw_auxiliary_history_seconds() < RAW_AUXILIARY_CAPTURE_SECONDS:
-            messagebox.showinfo(
-                "Raw capture still collecting",
-                "Wait until a full 60 seconds of AIN0/AIN1 data has been received.",
-                parent=self,
-            )
-            return
-        latest = self._raw_auxiliary_samples[-1].monotonic_seconds
-        cutoff = latest - RAW_AUXILIARY_CAPTURE_SECONDS
-        samples = tuple(sample for sample in self._raw_auxiliary_samples if sample.monotonic_seconds >= cutoff)
-        if len(samples) < 2:
-            messagebox.showerror("Raw capture unavailable", "No complete 60-second AIN0/AIN1 capture is available.", parent=self)
-            return
-
-        folder = (self.logger.folder / "diagnostics") if self.logger is not None else (self.run_output_root() / "diagnostics")
-        destination = folder / f"raw_ain0_ain1_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        temporary = destination.with_suffix(".tmp")
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            with temporary.open("w", newline="", encoding="utf-8") as output:
-                writer = csv.writer(output)
-                writer.writerow([
-                    "timestamp",
-                    "elapsed_seconds",
-                    "scan_rate_hz",
-                    "batch_received_at",
-                    "ain0_raw_volts",
-                    "ain1_raw_volts",
-                    "ain0_valid",
-                    "ain1_valid",
-                    "device_backlog",
-                    "ljm_backlog",
-                ])
-                first_time = samples[0].monotonic_seconds
-                for sample in samples:
-                    writer.writerow([
-                        sample.timestamp,
-                        f"{sample.monotonic_seconds - first_time:.6f}",
-                        f"{sample.scan_rate_hz:.3f}",
-                        sample.batch_received_at,
-                        "" if sample.ain0_voltage is None else f"{sample.ain0_voltage:.6f}",
-                        "" if sample.ain1_voltage is None else f"{sample.ain1_voltage:.6f}",
-                        "yes" if sample.ain0_voltage is not None else "",
-                        "yes" if sample.ain1_voltage is not None else "",
-                        sample.device_backlog,
-                        sample.ljm_backlog,
-                    ])
-                output.flush()
-                os.fsync(output.fileno())
-            temporary.replace(destination)
-        except OSError as error:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            messagebox.showerror("Raw capture failed", f"Could not save the 60-second capture:\n{error}", parent=self)
-            return
-
-        duration = samples[-1].monotonic_seconds - samples[0].monotonic_seconds
-        self.log_event("Raw auxiliary capture saved", f"{destination.name}: {len(samples):,} scans across {duration:.2f} seconds.")
-        messagebox.showinfo(
-            "Raw capture saved",
-            f"Saved {len(samples):,} AIN0/AIN1 scans across {duration:.2f} seconds.\n\n{destination}",
-            parent=self,
-        )
-
     def record_temperature(self, sensor_number: int, temperature_fahrenheit: float) -> None:
         """Accept one calibrated physical temperature and extend its test-history plot."""
         if sensor_number not in self.temperature_history:
@@ -3071,23 +2937,35 @@ class TestStandApp(tk.Tk):
         """Render one stable AIN0/AIN1 value per received shared-stream batch."""
         if not self.temperature_calibration or not isinstance(raw_samples, list):
             return
-        temperatures: list[float] = []
-        for raw_voltage in raw_samples:
-            try:
-                voltage = float(raw_voltage)
-                if math.isfinite(voltage):
-                    temperatures.append(temperature_from_amplified_voltage(voltage, self.temperature_calibration, channel))
-            except (TypeError, ValueError):
-                continue
         sensor_number = 1 if channel == "AIN0" else 2
-        if temperatures:
-            self.record_temperature(sensor_number, statistics.fmean(temperatures) * 9.0 / 5.0 + 32.0)
+        temperature_fahrenheit, fault_reason = summarize_temperature_fahrenheit_samples(
+            raw_samples, self.temperature_calibration, channel
+        )
+        fault_key = f"temperature_{sensor_number}_input"
+        if temperature_fahrenheit is not None:
+            self.record_temperature(sensor_number, temperature_fahrenheit)
             voltage = self.auxiliary_raw_voltages.get(channel)
             if voltage is not None:
                 self.temperature_detail_vars[sensor_number].set(f"{channel}: {voltage:.4f} V")
+            self._observe_fault(
+                fault_key,
+                f"Temperature {sensor_number} input fault",
+                "Valid temperature readings have recovered.",
+                False,
+            )
         elif self.labjack_available:
+            self.current_temperatures[sensor_number] = None
             self.metric_vars[f"temp_{sensor_number}"].set("— °F")
-            self.temperature_detail_vars[sensor_number].set(f"{channel} outside Type T range")
+            reason = fault_reason or f"{channel} has no usable temperature samples"
+            self.temperature_detail_vars[sensor_number].set(reason)
+            voltage = self.auxiliary_raw_voltages.get(channel)
+            voltage_detail = "" if voltage is None else f" Last {channel}: {voltage:.4f} V."
+            self._observe_fault(
+                fault_key,
+                f"Temperature {sensor_number} input fault",
+                f"{reason}.{voltage_detail} Check the probe, terminal block, and LJTick-InAmp wiring.",
+                True,
+            )
 
     def _record_cycle_frequency_history(self) -> None:
         """Sample the rolling CPM once per active second for the long-term graph."""
@@ -3096,20 +2974,118 @@ class TestStandApp(tk.Tk):
             return
         self.cycle_frequency_history.append((elapsed, self._frequency()))
 
+    def _campaign_configuration_values(self) -> dict[str, object]:
+        """Return only the portable setup needed to continue a campaign elsewhere."""
+        return {
+            "schema_version": 1,
+            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "position_calibration": self.position_calibration,
+            "pressure_calibration": self.pressure_calibration,
+            "temperature_calibration": self.temperature_calibration,
+            "cycle_stops": self.cycle_stops,
+        }
+
+    @staticmethod
+    def _campaign_setup_signature(configuration: dict[str, object]) -> str:
+        return json.dumps(
+            {key: configuration.get(key) for key in ("position_calibration", "pressure_calibration", "temperature_calibration", "cycle_stops")},
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _campaign_setup_summary(configuration: dict[str, object]) -> str:
+        labels = (
+            ("position_calibration", "AIN2 position"),
+            ("cycle_stops", "Cycle stops"),
+            ("pressure_calibration", "AIN4 pressure"),
+            ("temperature_calibration", "Temperatures"),
+        )
+        return "\n".join(f"• {label}: {'saved' if configuration.get(key) else 'not configured'}" for key, label in labels)
+
+    def _apply_campaign_configuration(self, configuration: dict[str, object]) -> bool:
+        """Replace local setup with a validated portable campaign snapshot."""
+        required_keys = ("position_calibration", "pressure_calibration", "temperature_calibration", "cycle_stops")
+        if any(key not in configuration for key in required_keys):
+            return False
+        file_map = (
+            ("position_calibration", "position_calibration.json"),
+            ("pressure_calibration", "pressure_calibration.json"),
+            ("temperature_calibration", "temperature_calibration.json"),
+            ("cycle_stops", "cycle_stops.json"),
+        )
+        previous = {filename: self.paths.read_config(filename) for _key, filename in file_map}
+        try:
+            for key, filename in file_map:
+                value = configuration[key]
+                if value is None:
+                    self.paths.remove_config(filename)
+                elif isinstance(value, dict):
+                    self.paths.write_config(filename, value)
+                else:
+                    raise ValueError(f"Campaign {key} is invalid.")
+            self.position_calibration = self.load_position_calibration()
+            self.pressure_calibration = self.load_pressure_calibration()
+            self.temperature_calibration = self.load_temperature_calibration()
+            self.cycle_stops = self.load_cycle_stops()
+            loaded = {
+                "position_calibration": self.position_calibration,
+                "pressure_calibration": self.pressure_calibration,
+                "temperature_calibration": self.temperature_calibration,
+                "cycle_stops": self.cycle_stops,
+            }
+            if any(configuration[key] is not None and loaded[key] is None for key in required_keys):
+                raise ValueError("Campaign setup could not be validated.")
+        except (OSError, TypeError, ValueError):
+            for _key, filename in file_map:
+                value = previous[filename]
+                if value is None:
+                    self.paths.remove_config(filename)
+                else:
+                    self.paths.write_config(filename, value)
+            self.position_calibration = self.load_position_calibration()
+            self.pressure_calibration = self.load_pressure_calibration()
+            self.temperature_calibration = self.load_temperature_calibration()
+            self.cycle_stops = self.load_cycle_stops()
+            return False
+
+        self.bushing_unit = "degrees" if self.position_calibration else "volts"
+        self._remove_fault("position_range")
+        self._remove_fault("pressure_range")
+        self._remove_fault("temperature_1_input")
+        self._remove_fault("temperature_2_input")
+        self.configure_bushing_plot()
+        self.configure_velocity_plot()
+        self.configure_pressure_plot()
+        self.temperature_history = {1: [], 2: []}
+        self.current_temperatures = {1: None, 2: None}
+        for sensor, channel in ((1, "AIN0"), (2, "AIN1")):
+            self.metric_vars[f"temp_{sensor}"].set("— °F")
+            self.temperature_detail_vars[sensor].set(f"Waiting for {channel}" if self.temperature_calibration else "Input not configured")
+        self._set_labjack_dependent_controls(self.labjack_available)
+        return True
+
+    def _write_campaign_configuration_snapshot(self) -> None:
+        if self.campaign is not None and self.current_live_run_id is None:
+            self.campaign.write_configuration(self._campaign_configuration_values())
+
     def _run_configuration_values(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "app_version": APP_VERSION,
             "data_model": {
                 "primary_record": "one summary row per completed cycle",
+                "position_calibration_extrapolation_fraction": POSITION_CALIBRATION_EXTRAPOLATION_FRACTION,
                 "dashboard_snapshot_log": False,
                 "grease_response_threshold_psi": INJECTOR_ACTIVATION_PSI,
                 "grease_comparison_cycles": GREASE_COMPARISON_CYCLE_COUNT,
                 "overlapping_grease_events_flagged": True,
             },
             "storage": {
-                "mode": "direct_run_folder",
+                "mode": "campaign_run_folder",
+                "campaign_id": self.campaign.campaign_id if self.campaign else None,
+                "campaign_name": self.campaign.name if self.campaign else None,
+                "campaign_session_id": self.current_campaign_session_id,
                 "output_root": str(self.active_run_output_root or self.run_output_root()),
             },
             "position_calibration": self.position_calibration,
@@ -3135,21 +3111,34 @@ class TestStandApp(tk.Tk):
         """Preserve current settings for the full application session."""
         if self.logger is not None:
             self.logger.write_run_configuration(self._run_configuration_values())
+        self._write_campaign_configuration_snapshot()
 
     def _begin_live_run(self) -> None:
+        if self.campaign is None:
+            raise RuntimeError("Create or select a campaign before starting a test run.")
         if self.logger is None:
             try:
-                output_root = self.run_output_root()
+                output_root = self.campaign.runs_root
                 self.logger = CsvLogger(output_root)
                 self.active_run_output_root = output_root
-                self.logger.update_manifest(app_version=APP_VERSION, data_model="completed_cycle_summary")
+                self.logger.update_manifest(
+                    app_version=APP_VERSION,
+                    data_model="completed_cycle_summary",
+                    campaign_id=self.campaign.campaign_id,
+                    campaign_name=self.campaign.name,
+                )
             except OSError as error:
                 self.logger = None
                 self.active_run_output_root = None
-                raise RuntimeError(f"Could not create the selected run folder: {error}") from error
+                raise RuntimeError(f"Could not create a run folder in the selected campaign: {error}") from error
         live_run = self.logger.begin_live_run(self._run_configuration_values(), self.cycles)
         self.current_live_run_id = str(live_run["id"])
         self.current_live_run_cycle_start = int(live_run["completed_cycles_at_start"])
+        self.current_campaign_session_id = self.campaign.begin_session(self.logger.folder, self.cycles)
+        self.logger.update_manifest(campaign_session_id=self.current_campaign_session_id)
+        configuration = self._run_configuration_values()
+        self.logger.update_live_run_configuration(self.current_live_run_id, configuration)
+        self.logger.write_run_configuration(configuration)
         self._recent_cycle_summaries.clear()
 
     def _finish_live_run(self, status: str) -> None:
@@ -3167,7 +3156,15 @@ class TestStandApp(tk.Tk):
             completed_cycles=self.cycles,
             cycle_frequency_cpm=round(self._frequency(), 2),
         )
+        if self.campaign is not None and self.current_campaign_session_id is not None:
+            self.campaign.finish_session(
+                self.current_campaign_session_id,
+                status=status,
+                completed_cycles=self.cycles,
+                active_test_seconds=self.test_elapsed_seconds,
+            )
         self.current_live_run_id = None
+        self.current_campaign_session_id = None
         self.logger.finalize(
             completed_cycles=self.cycles,
             cycle_frequency_cpm=round(self._frequency(), 2),
@@ -3186,17 +3183,26 @@ class TestStandApp(tk.Tk):
             self.cycle_state = "waiting_for_retracted"
             self.log_event("Cycle counting stopped", "LabJack disconnected.")
             self._finish_live_run("interrupted_by_disconnect")
-        count_ready = bool(available and self.position_calibration and self.cycle_stops)
+        count_ready = bool(available and self.campaign and self.position_calibration and self.cycle_stops)
         self._refresh_setup_status()
         if self.is_running:
             self.start_button.configure(text="Resume" if self.current_live_run_id else "Start", state="disabled")
             self.stop_button.configure(state="normal" if available else "disabled")
+            self.reset_button.configure(state="normal")
             return
 
         self.start_button.configure(text="Resume" if self.current_live_run_id else "Start", state="normal" if count_ready else "disabled")
         self.stop_button.configure(state="disabled")
+        self.reset_button.configure(state="normal" if self.current_live_run_id else "disabled")
 
     def start_counting(self) -> None:
+        if self.campaign is None:
+            messagebox.showerror(
+                "Campaign required",
+                "Create or select a campaign before starting cycle counting.",
+                parent=self,
+            )
+            return
         if not self.labjack_available:
             messagebox.showerror(
                 "LabJack required",
@@ -3224,8 +3230,8 @@ class TestStandApp(tk.Tk):
         self.is_running = True
         self.cycle_state = "waiting_for_retracted"
         self._cycle_capture = None
-        # A dashboard round is one direct-output folder. Start after Pause
-        # resumes that same folder rather than opening another export item.
+        # A dashboard run lives in the explicitly selected campaign. Start
+        # after Pause resumes the same dated run; a later Start opens a new one.
         self.cycle_times.clear()
         if not resuming:
             try:
@@ -3255,23 +3261,21 @@ class TestStandApp(tk.Tk):
             self.is_running = False
             self.stop_ps12dc_for_test_pause()
             self._discard_cycle_capture("Saved before the count stop was reached.")
-            self.log_event("Test round saved", "The test round was finalized and the dashboard cleared for the next round.")
+            self.log_event("Test run saved", "The run was finalized; the campaign total is retained.")
             self._finish_live_run("saved")
-        self.cycles = 0
         self.cycle_times.clear()
-        self.test_elapsed_seconds = 0.0
         for history in self.temperature_history.values():
             history.clear()
         self.current_temperatures = {1: None, 2: None}
         self.cycle_frequency_history.clear()
         self.cycle_state = "waiting_for_retracted"
-        self.metric_vars["cycles"].set("0")
+        self.metric_vars["cycles"].set(str(self.cycles))
         self.metric_vars["frequency"].set("0.0 cpm")
-        self.metric_vars["test_time"].set("00:00:00")
+        self.metric_vars["test_time"].set(self._format_test_time(self.test_elapsed_seconds))
         self._set_labjack_dependent_controls(self.labjack_available)
         self.log_event(
-            "Dashboard reset",
-            "Ready for a new test round.",
+            "Run ended",
+            "Campaign total retained. Start creates the next run in this campaign.",
         )
 
     def _frequency(self) -> float:
@@ -3297,7 +3301,7 @@ class TestStandApp(tk.Tk):
         messagebox.showwarning(
             "Save the test run first",
             "Calibration and cycle stops are locked while a test run is open. "
-            "Choose Save & Reset before changing them so the saved run has one unambiguous configuration.",
+                "Choose End Run before changing them so the saved run has one unambiguous configuration.",
             parent=self,
         )
         return True
@@ -3320,6 +3324,7 @@ class TestStandApp(tk.Tk):
         self.paths.write_config("position_calibration.json", calibration)
         self.position_calibration = calibration
         self.bushing_unit = "degrees"
+        self._remove_fault("position_range")
         self.configure_bushing_plot()
         self.configure_velocity_plot()
         self._cycle_capture = None
@@ -3334,6 +3339,7 @@ class TestStandApp(tk.Tk):
         self.paths.remove_config("position_calibration.json")
         self.position_calibration = None
         self.bushing_unit = "volts"
+        self._remove_fault("position_range")
         self.configure_bushing_plot()
         self.configure_velocity_plot()
         self._cycle_capture = None
@@ -3364,6 +3370,7 @@ class TestStandApp(tk.Tk):
         self.pressure_calibration = calibration
         self._display_pressure_voltage_samples.clear()
         self.grease_pressure = None
+        self._remove_fault("pressure_range")
         self.metric_vars["pressure"].set("— psi")
         self.pressure_detail_var.set("Waiting for AIN4")
         self.configure_pressure_plot()
@@ -3378,6 +3385,7 @@ class TestStandApp(tk.Tk):
         self.pressure_calibration = None
         self._display_pressure_voltage_samples.clear()
         self.grease_pressure = None
+        self._remove_fault("pressure_range")
         self.metric_vars["pressure"].set("— psi")
         self.pressure_detail_var.set("Input not configured")
         self.configure_pressure_plot()
@@ -3420,6 +3428,8 @@ class TestStandApp(tk.Tk):
         self.temperature_calibration = calibration
         self.temperature_history = {1: [], 2: []}
         self.current_temperatures = {1: None, 2: None}
+        self._remove_fault("temperature_1_input")
+        self._remove_fault("temperature_2_input")
         for sensor, channel in ((1, "AIN0"), (2, "AIN1")):
             self.metric_vars[f"temp_{sensor}"].set("— °F")
             self.temperature_detail_vars[sensor].set(f"Waiting for {channel}")
@@ -3435,6 +3445,8 @@ class TestStandApp(tk.Tk):
         self.temperature_calibration = None
         self.temperature_history = {1: [], 2: []}
         self.current_temperatures = {1: None, 2: None}
+        self._remove_fault("temperature_1_input")
+        self._remove_fault("temperature_2_input")
         for sensor in (1, 2):
             self.metric_vars[f"temp_{sensor}"].set("— °F")
             self.temperature_detail_vars[sensor].set("Input not configured")
@@ -3492,7 +3504,9 @@ class TestStandApp(tk.Tk):
         first_angle, second_angle = float(first["angle"]), float(second["angle"])
         fraction = (voltage - first_voltage) / (second_voltage - first_voltage)
         angle = first_angle + fraction * (second_angle - first_angle)
-        outside = voltage < min(first_voltage, second_voltage) or voltage > max(first_voltage, second_voltage)
+        span = abs(second_voltage - first_voltage)
+        extension = span * POSITION_CALIBRATION_EXTRAPOLATION_FRACTION
+        outside = voltage < min(first_voltage, second_voltage) - extension or voltage > max(first_voltage, second_voltage) + extension
         return angle, outside
 
     @staticmethod
@@ -3699,6 +3713,8 @@ class TestStandApp(tk.Tk):
             self.logger.log_cycle(values, self.current_live_run_id)
             self._add_cycle_to_grease_comparisons(values)
             self._cycle_capture = None
+        if self.campaign is not None:
+            self.campaign.record_progress(self.cycles, self.test_elapsed_seconds)
         self.log_event(
             "Cycle detected",
             f"Cycle {self.cycles} reached count stop ({extended:.3f}°) after reset stop ({retracted:.3f}°).",
@@ -3749,6 +3765,20 @@ class TestStandApp(tk.Tk):
                     if self._cycle_capture is not None:
                         self._cycle_capture.stream_gap_detected = True
                     self._snapshot_stream_gap_pending = True
+                    self._observe_fault(
+                        "ain2_stream_gap",
+                        "AIN2 stream gap",
+                        "One or more AIN2 samples were unavailable; velocity is rearming and the affected snapshot is marked.",
+                        True,
+                        activation_batches=1,
+                    )
+                else:
+                    self._observe_fault(
+                        "ain2_stream_gap",
+                        "AIN2 stream gap",
+                        "AIN2 stream is continuous.",
+                        False,
+                    )
                 samples = result.get("samples", [])
                 if not isinstance(samples, list):
                     samples = []
@@ -3761,14 +3791,6 @@ class TestStandApp(tk.Tk):
                     batch_end_at = datetime.fromisoformat(str(result.get("batch_ended_at", "")))
                 except (TypeError, ValueError):
                     batch_end_at = datetime.now().astimezone()
-                try:
-                    device_backlog = int(result.get("device_backlog", 0))
-                except (TypeError, ValueError):
-                    device_backlog = 0
-                try:
-                    ljm_backlog = int(result.get("ljm_backlog", 0))
-                except (TypeError, ValueError):
-                    ljm_backlog = 0
                 scan_count = len(samples)
                 if self._last_ain2_sample_monotonic is not None and batch_end_monotonic <= self._last_ain2_sample_monotonic:
                     # A restarted helper must never make graph time move backward.
@@ -3776,14 +3798,6 @@ class TestStandApp(tk.Tk):
                     correction = corrected_end - batch_end_monotonic
                     batch_end_monotonic = corrected_end
                     batch_end_at += timedelta(seconds=correction)
-                self._record_raw_auxiliary_scans(
-                    result.get("auxiliary_scans", []),
-                    scan_rate_hz,
-                    batch_end_monotonic,
-                    batch_end_at,
-                    device_backlog,
-                    ljm_backlog,
-                )
                 pressure_samples = result.get("ain4_samples", [])
                 if not isinstance(pressure_samples, list):
                     pressure_samples = []
@@ -3886,10 +3900,22 @@ class TestStandApp(tk.Tk):
         if outside or not math.isfinite(pressure) or pressure < 0:
             self.metric_vars["pressure"].set("— psi")
             self.pressure_detail_var.set(f"AIN4: {voltage:.4f} V • OUT")
+            self._observe_fault(
+                "pressure_range",
+                "Pressure input outside calibration range",
+                "AIN4 is outside the saved pressure calibration margin; this reading is not used for grease response data.",
+                True,
+            )
             return
         self.metric_vars["pressure"].set(f"{pressure:,.0f} psi")
         self.pressure_detail_var.set("")
         self.pressure_plot.add(pressure, self._latest_display_sample_monotonic)
+        self._observe_fault(
+            "pressure_range",
+            "Pressure input outside calibration range",
+            "AIN4 readings have recovered.",
+            False,
+        )
 
     def _render_live_bushing_position(self, voltage: float) -> None:
         """Render a short display-only average without affecting cycle detection."""
@@ -3902,6 +3928,12 @@ class TestStandApp(tk.Tk):
             if outside:
                 detail += " • OUT"
             self.bushing_detail_var.set(detail)
+            self._observe_fault(
+                "position_range",
+                "AIN2 position outside calibration range",
+                "AIN2 is beyond the saved calibration margin; velocity and cycle metrics are unavailable until it returns.",
+                outside,
+            )
             if not self.graphs_paused:
                 self.bushing_plot.add(angle, self._latest_display_sample_monotonic)
         else:
@@ -4169,8 +4201,219 @@ class TestStandApp(tk.Tk):
     def open_calibration_window(self) -> None:
         PositionCalibrationDialog(self)
 
-    def open_export_window(self, preselect_run_id: str | None = None) -> None:
-        ExportDataDialog(self, preselect_run_id=preselect_run_id)
+    def export_calibration_package(self) -> None:
+        """Export the current portable instrument setup without any test data."""
+        configuration = self._campaign_configuration_values()
+        setup_keys = ("position_calibration", "pressure_calibration", "temperature_calibration", "cycle_stops")
+        if not any(configuration.get(key) for key in setup_keys):
+            messagebox.showinfo("No setup to export", "Save at least one calibration or cycle-stop setup first.", parent=self)
+            return
+        destination = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Calibration Package",
+            defaultextension=".zip",
+            filetypes=(("ZIP archive", "*.zip"),),
+            initialfile=f"TestStand_Calibration_{datetime.now():%Y%m%d_%H%M%S}.zip",
+        )
+        if not destination:
+            return
+        try:
+            write_calibration_package(Path(destination), configuration)
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            messagebox.showerror("Calibration export failed", f"Could not create the calibration package:\n{error}", parent=self)
+            return
+        self.log_event("Calibration package exported", Path(destination).name)
+        messagebox.showinfo("Calibration package created", f"Saved calibration setup.\n\n{destination}", parent=self)
+
+    def import_calibration_package(self) -> None:
+        """Validate and apply a portable calibration setup only while no run is open."""
+        if self._configuration_change_is_locked():
+            return
+        source = filedialog.askopenfilename(
+            parent=self,
+            title="Import Calibration Package",
+            filetypes=(("ZIP archive", "*.zip"),),
+        )
+        if not source:
+            return
+        try:
+            configuration = read_calibration_package(Path(source))
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            messagebox.showerror("Calibration import failed", f"Could not read the calibration package:\n{error}", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Apply calibration package?",
+            "This replaces this computer's saved setup with:\n\n"
+            f"{self._campaign_setup_summary(configuration)}\n\n"
+            "No run data will be changed.",
+            parent=self,
+        ):
+            return
+        if not self._apply_campaign_configuration(configuration):
+            messagebox.showerror(
+                "Calibration package invalid",
+                "The package could not be validated. No local setup was changed.",
+                parent=self,
+            )
+            return
+        self._write_campaign_configuration_snapshot()
+        self.log_event("Calibration package imported", Path(source).name)
+        messagebox.showinfo("Calibration applied", "Saved setup has been applied to this computer.", parent=self)
+
+    def open_campaign_window(self) -> None:
+        if self.current_live_run_id:
+            messagebox.showwarning(
+                "End current run first",
+                "End the current run before creating or selecting a different campaign.",
+                parent=self,
+            )
+            return
+        existing = self.campaign_window
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        self.campaign_window = CampaignDialog(self)
+
+    def export_campaign_package(self) -> None:
+        """Package one closed campaign for an auditable teammate handoff."""
+        if self.campaign is None:
+            messagebox.showerror("Campaign required", "Select a campaign before exporting its package.", parent=self)
+            return
+        if self.current_live_run_id:
+            messagebox.showwarning(
+                "End current run first",
+                "End the current run before creating a campaign handoff package.",
+                parent=self,
+            )
+            return
+        destination = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Campaign Package",
+            defaultextension=".zip",
+            filetypes=(("ZIP archive", "*.zip"),),
+            initialfile=f"{self.campaign.folder.name}_package.zip",
+        )
+        if not destination:
+            return
+        try:
+            count = write_campaign_package(Path(destination), self.campaign)
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            messagebox.showerror("Campaign export failed", f"Could not create the campaign package:\n{error}", parent=self)
+            return
+        messagebox.showinfo(
+            "Campaign package created",
+            f"Created a complete campaign package with {count} files.\n\n{destination}",
+            parent=self,
+        )
+
+    def import_campaign_package(self) -> None:
+        """Copy a teammate's campaign package into the selected local output root."""
+        if self.current_live_run_id:
+            messagebox.showwarning(
+                "End current run first",
+                "End the current run before importing a different campaign.",
+                parent=self,
+            )
+            return
+        source = filedialog.askopenfilename(
+            parent=self,
+            title="Import Campaign Package",
+            filetypes=(("ZIP archive", "*.zip"),),
+        )
+        if not source:
+            return
+        try:
+            campaign = import_campaign_package(Path(source), self.run_output_root())
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            messagebox.showerror("Campaign import failed", f"Could not import the campaign package:\n{error}", parent=self)
+            return
+        if self.select_campaign(campaign):
+            messagebox.showinfo(
+                "Campaign imported",
+                f"Imported and selected '{campaign.name}'. Its saved setup is ready to apply if needed.",
+                parent=self,
+            )
+
+    def select_campaign(self, campaign: Campaign) -> bool:
+        """Load a user-selected campaign's durable count before a new session starts."""
+        if self.current_live_run_id:
+            messagebox.showwarning(
+                "End current run first",
+                "End the current run before selecting a different campaign.",
+                parent=self,
+            )
+            return False
+        if campaign.manifest.get("status") != "active":
+            messagebox.showerror("Campaign completed", "Create a new campaign to record additional runs.", parent=self)
+            return False
+        configuration = campaign.read_configuration()
+        if configuration is None:
+            campaign.write_configuration(self._campaign_configuration_values())
+        elif self._campaign_setup_signature(configuration) != self._campaign_setup_signature(self._campaign_configuration_values()):
+            if not messagebox.askyesno(
+                "Apply campaign setup",
+                f"Use the saved setup from '{campaign.name}' on this computer?\n\n"
+                f"{self._campaign_setup_summary(configuration)}\n\n"
+                "This replaces this computer's saved position, pressure, temperature, and cycle-stop settings.",
+                parent=self,
+            ):
+                return False
+            if not self._apply_campaign_configuration(configuration):
+                messagebox.showerror(
+                    "Campaign setup invalid",
+                    "The saved campaign setup could not be validated. No local setup was changed.",
+                    parent=self,
+                )
+                return False
+        self.campaign = campaign
+        self.current_campaign_session_id = None
+        self.cycles = campaign.completed_cycles
+        self.test_elapsed_seconds = campaign.active_test_seconds
+        self.cycle_times.clear()
+        self.cycle_frequency_history.clear()
+        self._recent_cycle_summaries.clear()
+        self.metric_vars["cycles"].set(str(self.cycles))
+        self.metric_vars["frequency"].set("0.0 cpm")
+        self.metric_vars["test_time"].set(self._format_test_time(self.test_elapsed_seconds))
+        self._set_labjack_dependent_controls(self.labjack_available)
+        self.log_event("Campaign selected", f"{campaign.name}: continuing from cycle {self.cycles:,}.")
+        return True
+
+    def finish_selected_campaign(self) -> None:
+        if self.campaign is None:
+            messagebox.showinfo("No campaign selected", "Create or select a campaign first.", parent=self)
+            return
+        if self.current_live_run_id:
+            messagebox.showwarning(
+                "End current run first",
+                "End the current run before finishing its campaign.",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "Finish campaign permanently?",
+            f"Finish '{self.campaign.name}'?\n\n"
+            "This permanently closes the campaign in the application. Its data remains available for review and export, "
+            "but no additional runs can be added.\n\n"
+            "Use End Run instead if you plan to resume this campaign later.",
+            parent=self,
+        ):
+            return
+        finished_name = self.campaign.name
+        self.campaign.finish()
+        self.campaign = None
+        self.current_campaign_session_id = None
+        self.cycles = 0
+        self.test_elapsed_seconds = 0.0
+        self.cycle_times.clear()
+        self.cycle_frequency_history.clear()
+        self.metric_vars["cycles"].set("0")
+        self.metric_vars["frequency"].set("0.0 cpm")
+        self.metric_vars["test_time"].set("00:00:00")
+        self._set_labjack_dependent_controls(self.labjack_available)
+        self.log_event("Campaign finished", f"{finished_name} was closed at its saved total.")
 
     def run_output_root(self) -> Path:
         configured = str(self.run_output_config.get("directory", "")).strip()
@@ -4189,34 +4432,21 @@ class TestStandApp(tk.Tk):
             return
         self.run_output_config = {"directory": selected}
         self.paths.write_config(RUN_OUTPUT_CONFIG_FILENAME, self.run_output_config)
-        detail = "The selected folder applies to the next test round." if self.current_live_run_id else "New test rounds will be saved here."
+        detail = "The selected folder applies to newly created campaigns." if self.campaign is not None else "New campaigns will be saved here."
         self.log_event("Run output folder changed", detail)
 
     def use_default_run_output_folder(self) -> None:
         self.run_output_config = {"directory": ""}
         self.paths.write_config(RUN_OUTPUT_CONFIG_FILENAME, self.run_output_config)
-        self.log_event("Run output folder reset", f"New test rounds will use {self.run_output_root()}.")
+        self.log_event("Run output folder reset", f"New campaigns will use {self.run_output_root()}.")
 
     def open_run_output_folder(self) -> None:
-        target = self.active_run_output_root or self.run_output_root()
+        target = self.campaign.folder if self.campaign is not None else (self.active_run_output_root or self.run_output_root())
         try:
             target.mkdir(parents=True, exist_ok=True)
             os.startfile(target)  # type: ignore[attr-defined]
         except OSError as error:
             messagebox.showerror("Open Run Output Folder", f"Could not open the run output folder:\n{error}", parent=self)
-
-    def available_run_folders(self) -> list[Path]:
-        """Return direct-output test folders from the current and active roots."""
-        roots = {self.run_output_root()}
-        if self.logger is not None:
-            roots.add(self.logger.folder.parent)
-        folders: list[Path] = []
-        for root in roots:
-            try:
-                folders.extend(folder for folder in root.glob("Run_*") if folder.is_dir())
-            except OSError:
-                continue
-        return sorted(set(folders), key=lambda folder: folder.name, reverse=True)
 
     def open_cycle_stops_window(self) -> None:
         if not self.position_calibration:
@@ -4228,66 +4458,66 @@ class TestStandApp(tk.Tk):
             return
         CycleStopsDialog(self)
 
+    def _clear_unavailable_input_state(self) -> None:
+        """Clear live-only values after the shared T4 stream becomes unavailable."""
+        self._pending_s0_requests.clear()
+        self.bushing_position = self.ain2_voltage = self.ain4_voltage = self.bushing_velocity = None
+        self.auxiliary_raw_voltages = {"AIN0": None, "AIN1": None}
+        self.current_temperatures = {1: None, 2: None}
+        for key, value in (("position", "—"), ("velocity", "— °/s"), ("pressure", "— psi"), ("temp_1", "— °F"), ("temp_2", "— °F")):
+            self.metric_vars[key].set(value)
+        self.bushing_detail_var.set("AIN2 unavailable")
+        self.pressure_detail_var.set("AIN4 unavailable" if self.pressure_calibration else "Input not configured")
+        for sensor, channel in ((1, "AIN0"), (2, "AIN1")):
+            self.temperature_detail_vars[sensor].set(
+                f"{channel} unavailable" if self.temperature_calibration else "Input not configured"
+            )
+
     def _set_labjack_connection_state(self, state: str, detail: str) -> None:
         """Render a connection state from the same process that reads AIN2."""
+        if state == "connected":
+            self._labjack_seen_connected = True
+        connection_lost = self._labjack_seen_connected and state != "connected"
         signature = f"{state}|{detail}"
         # A healthy helper emits a stream batch about every 50 ms. Reapplying
         # the same labels, buttons, and checklist for every batch creates
         # needless Tk work and can starve display updates during long charts.
         if signature == self.last_labjack_signature:
+            self._observe_fault(
+                "labjack_connection",
+                "LabJack connection lost",
+                "The T4 stream is unavailable. Counting has been stopped and the active run was finalized.",
+                connection_lost,
+                activation_batches=1,
+                clear_batches=1,
+            )
             return
         if state == "connected":
             text, color = "LabJack T4 • Connected • USB", "#86efac"
             event, event_detail = "LabJack connected", "AIN2 sampling active."
             self._last_runtime_error = ""
         elif state == "disconnected":
-            self._pending_s0_requests.clear()
             text, color = "LabJack T4 • Disconnected", "#fbbf24"
             event, event_detail = "LabJack disconnected", detail
-            self.bushing_position = None
-            self.ain2_voltage = None
-            self.ain4_voltage = None
-            self.bushing_velocity = None
-            self.auxiliary_raw_voltages = {"AIN0": None, "AIN1": None}
-            self.current_temperatures = {1: None, 2: None}
-            self._last_auxiliary_capture_monotonic = None
-            self._last_auxiliary_capture_at = None
-            self.metric_vars["position"].set("—")
-            self.metric_vars["velocity"].set("— °/s")
-            self.metric_vars["pressure"].set("— psi")
-            self.metric_vars["temp_1"].set("— °F")
-            self.metric_vars["temp_2"].set("— °F")
-            self.bushing_detail_var.set("AIN2 unavailable")
-            self.pressure_detail_var.set("AIN4 unavailable" if self.pressure_calibration else "Input not configured")
-            self.temperature_detail_vars[1].set("AIN0 unavailable" if self.temperature_calibration else "Input not configured")
-            self.temperature_detail_vars[2].set("AIN1 unavailable" if self.temperature_calibration else "Input not configured")
+            self._clear_unavailable_input_state()
         else:
-            self._pending_s0_requests.clear()
             text, color = "LabJack T4 • Connection error", "#fca5a5"
             event, event_detail = "LabJack connection error", detail
-            self.bushing_position = None
-            self.ain2_voltage = None
-            self.ain4_voltage = None
-            self.bushing_velocity = None
-            self.auxiliary_raw_voltages = {"AIN0": None, "AIN1": None}
-            self.current_temperatures = {1: None, 2: None}
-            self._last_auxiliary_capture_monotonic = None
-            self._last_auxiliary_capture_at = None
-            self.metric_vars["position"].set("—")
-            self.metric_vars["velocity"].set("— °/s")
-            self.metric_vars["pressure"].set("— psi")
-            self.metric_vars["temp_1"].set("— °F")
-            self.metric_vars["temp_2"].set("— °F")
-            self.bushing_detail_var.set("AIN2 unavailable")
-            self.pressure_detail_var.set("AIN4 unavailable" if self.pressure_calibration else "Input not configured")
-            self.temperature_detail_vars[1].set("AIN0 unavailable" if self.temperature_calibration else "Input not configured")
-            self.temperature_detail_vars[2].set("AIN1 unavailable" if self.temperature_calibration else "Input not configured")
+            self._clear_unavailable_input_state()
 
         self._set_labjack_dependent_controls(state == "connected")
         self.labjack_status_var.set(text)
         self.labjack_status_label.configure(foreground=color)
         self.last_labjack_signature = signature
         self.log_event(event, event_detail)
+        self._observe_fault(
+            "labjack_connection",
+            "LabJack connection lost",
+            "The T4 stream is unavailable. Counting has been stopped and the active run was finalized.",
+            connection_lost,
+            activation_batches=1,
+            clear_batches=1,
+        )
 
     def record_grease_injection(self, commanded_pulse_seconds: float | None = None) -> str | None:
         """Register a confirmed injector firing for later pressure/cycle comparison."""
@@ -4425,7 +4655,7 @@ class TestStandApp(tk.Tk):
 if __name__ == "__main__":
     # In the packaged release, the GUI launches the dedicated diagnostic helper
     # for AIN2 streaming. Keep this dispatch for a direct helper invocation too.
-    if any(argument in sys.argv for argument in ("--child-probe", "--sample-ain2", "--stream-ain2", "--json")):
+    if any(argument in sys.argv for argument in ("--child-probe", "--stream-ain2", "--json")):
         from labjack_diagnostic import main as diagnostic_main
 
         raise SystemExit(diagnostic_main())
