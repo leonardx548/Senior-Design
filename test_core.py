@@ -10,6 +10,7 @@ import zipfile
 import os
 from collections import deque
 from pathlib import Path
+from unittest.mock import patch
 
 from app_storage import AppPaths, Campaign, CsvLogger
 from labjack_diagnostic import (
@@ -148,6 +149,45 @@ class CoreSafetyTests(unittest.TestCase):
         imported_folder_archive = import_campaign_package(folder_archive, destination_root)
         self.assertEqual(imported_folder_archive.name, "Team handoff")
         self.assertEqual(imported_folder_archive.completed_cycles, 14)
+
+    def test_campaign_selects_when_saved_setup_is_declined(self) -> None:
+        campaign = Campaign.create(self.temporary_directory, "Keep local setup")
+        campaign.write_configuration(
+            {
+                "schema_version": 1,
+                "captured_at": "2026-11-17T10:00:00-05:00",
+                "position_calibration": {"point_1": {"voltage": 0.5, "angle": 0.0}},
+                "pressure_calibration": None,
+                "temperature_calibration": None,
+                "cycle_stops": {"retracted": 0.0, "extended": 30.0},
+            }
+        )
+
+        class Value:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        app = TestStandApp.__new__(TestStandApp)
+        app.current_live_run_id = None
+        app.position_calibration = None
+        app.pressure_calibration = None
+        app.temperature_calibration = None
+        app.cycle_stops = None
+        app.cycle_times = deque()
+        app.cycle_frequency_history = []
+        app._recent_cycle_summaries = deque()
+        app.metric_vars = {key: Value() for key in ("cycles", "frequency", "test_time")}
+        app.labjack_available = False
+        app._set_labjack_dependent_controls = lambda _available: None
+        app.log_event = lambda *_args: None
+
+        with patch("test_stand_app.messagebox.askyesno", return_value=False):
+            self.assertTrue(app.select_campaign(campaign))
+        self.assertIs(app.campaign, campaign)
+        self.assertIsNone(app.position_calibration)
 
     def test_calibration_package_round_trip_contains_setup_only(self) -> None:
         setup = {

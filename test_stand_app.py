@@ -41,7 +41,7 @@ from labjack_diagnostic import (
 
 
 UPDATE_MS = 100
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 AIN2_POLL_SECONDS = 0.75
 INJECTOR_ACTIVATION_PSI = 1500.0
 GREASE_COMPARISON_CYCLE_COUNT = 3
@@ -4316,15 +4316,14 @@ class TestStandApp(tk.Tk):
         if configuration is None:
             campaign.write_configuration(self._campaign_configuration_values())
         elif self._campaign_setup_signature(configuration) != self._campaign_setup_signature(self._campaign_configuration_values()):
-            if not messagebox.askyesno(
+            use_saved_setup = messagebox.askyesno(
                 "Apply campaign setup",
                 f"Use the saved setup from '{campaign.name}' on this computer?\n\n"
                 f"{self._campaign_setup_summary(configuration)}\n\n"
                 "This replaces this computer's saved position, pressure, temperature, and cycle-stop settings.",
                 parent=self,
-            ):
-                return False
-            if not self._apply_campaign_configuration(configuration):
+            )
+            if use_saved_setup and not self._apply_campaign_configuration(configuration):
                 messagebox.showerror(
                     "Campaign setup invalid",
                     "The saved campaign setup could not be validated. No local setup was changed.",
