@@ -450,21 +450,52 @@ def write_campaign_package(destination: Path, campaign: Campaign) -> int:
 
 
 def import_campaign_package(source: Path, output_root: Path) -> Campaign:
-    """Safely import a campaign ZIP without overwriting an existing campaign."""
+    """Safely import an exported campaign package or a single-folder campaign ZIP."""
     temporary_root: Path | None = None
     try:
         with zipfile.ZipFile(source, "r") as archive:
+            file_infos = [info for info in archive.infolist() if not info.is_dir()]
+            if not file_infos:
+                raise ValueError("This ZIP does not contain campaign files.")
             try:
                 package_manifest = json.loads(archive.read(CAMPAIGN_PACKAGE_MANIFEST_FILENAME).decode("utf-8"))
-            except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                raise ValueError("This ZIP is not a Senior Design campaign package.") from error
+            except KeyError:
+                # Older builds and Windows' folder-compress workflow produce a
+                # valid campaign-folder ZIP without the package wrapper. Accept
+                # exactly one safe Campaign_* root and validate its own manifest.
+                roots = {
+                    PurePosixPath(info.filename).parts[0]
+                    for info in file_infos
+                    if PurePosixPath(info.filename).parts
+                }
+                if len(roots) != 1:
+                    raise ValueError("This ZIP is not a single Senior Design campaign folder.")
+                campaign_folder_name = roots.pop()
+                if not campaign_folder_name.startswith("Campaign_") or any(
+                    token in campaign_folder_name for token in ("/", "\\", "..")
+                ):
+                    raise ValueError("This ZIP has an unsafe campaign folder name.")
+                try:
+                    campaign_manifest = json.loads(
+                        archive.read(f"{campaign_folder_name}/campaign_manifest.json").decode("utf-8")
+                    )
+                except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError("This ZIP does not contain a valid campaign manifest.") from error
+                if not isinstance(campaign_manifest, dict) or not str(campaign_manifest.get("campaign_id", "")):
+                    raise ValueError("This ZIP has an invalid campaign manifest.")
+                package_manifest = {
+                    "campaign_folder": campaign_folder_name,
+                    "campaign_id": campaign_manifest["campaign_id"],
+                }
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("This ZIP has an invalid campaign package manifest.") from error
             if not isinstance(package_manifest, dict):
                 raise ValueError("This ZIP has an invalid campaign package manifest.")
             campaign_folder_name = str(package_manifest.get("campaign_folder", ""))
             if not campaign_folder_name.startswith("Campaign_") or any(token in campaign_folder_name for token in ("/", "\\", "..")):
                 raise ValueError("This ZIP has an unsafe campaign folder name.")
             prefix = f"{campaign_folder_name}/"
-            file_infos = [info for info in archive.infolist() if not info.is_dir() and info.filename != CAMPAIGN_PACKAGE_MANIFEST_FILENAME]
+            file_infos = [info for info in file_infos if info.filename != CAMPAIGN_PACKAGE_MANIFEST_FILENAME]
             if not file_infos or any(not info.filename.startswith(prefix) for info in file_infos):
                 raise ValueError("This ZIP has an invalid campaign file layout.")
 

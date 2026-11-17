@@ -140,6 +140,15 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertNotEqual(duplicate.folder, imported.folder)
         self.assertTrue(duplicate.folder.name.endswith("_02"))
 
+        folder_archive = self.temporary_directory / "campaign_folder.zip"
+        with zipfile.ZipFile(folder_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for source_file in campaign.folder.rglob("*"):
+                if source_file.is_file():
+                    archive.write(source_file, f"{campaign.folder.name}/{source_file.relative_to(campaign.folder).as_posix()}")
+        imported_folder_archive = import_campaign_package(folder_archive, destination_root)
+        self.assertEqual(imported_folder_archive.name, "Team handoff")
+        self.assertEqual(imported_folder_archive.completed_cycles, 14)
+
     def test_calibration_package_round_trip_contains_setup_only(self) -> None:
         setup = {
             "schema_version": 1,
